@@ -27,4 +27,5 @@ AC_FUNC_FORK
 AC_CHECK_FUNCS([memmove memset select socket])
 
 AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([tuncat.spec])
 AC_OUTPUT
