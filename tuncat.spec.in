@@ -5,7 +5,7 @@ Release: 1%{?dist}
 License: none
 Group: Applications/Utilities
 URL: https://bitbucket.org/mako10k/tuncat
-Source: https://bitbucket.org/mako10k/tuncat/src/tuncat-0.9.3.tar.gz
+Source: https://bitbucket.org/mako10k/tuncat/downloads/tuncat-@VERSION@.tar.gz
 Requires: snappy
 BuildRequires: gcc make automake snappy-devel
 Provides: tuncat = @VERSION@
