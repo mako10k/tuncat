@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <net/if.h> // must be before <linux/if.h>
 
+#include <errno.h>
 #include <getopt.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
@@ -236,6 +237,19 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
     close(sock);
   }
 
+  if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+    perror("fcntl");
+    return EXIT_FAILURE;
+  }
+  if (fcntl(tr_ifd, F_SETFL, O_NONBLOCK) == -1) {
+    perror("fcntl");
+    return EXIT_FAILURE;
+  }
+  if (tr_ifd != tr_ofd && fcntl(tr_ofd, F_SETFL, O_NONBLOCK) == -1) {
+    perror("fcntl");
+    return EXIT_FAILURE;
+  }
+
   if_ifd = fd;
   if_ofd = fd;
 
@@ -350,6 +364,10 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
 
       rsiz = read(if_ifd, if_ibuf, if_isiz);
       if (rsiz == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
         perror("read");
         return EXIT_FAILURE;
       }
@@ -366,6 +384,10 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
 
       wsiz = write(if_ofd, if_obuf, if_opos);
       if (wsiz == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
         perror("write");
         return EXIT_FAILURE;
       }
@@ -382,6 +404,10 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
 
       rsiz = read(tr_ifd, tr_ibuf + tr_ipos, tr_isiz - tr_ipos);
       if (rsiz == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
         perror("read");
         return EXIT_FAILURE;
       }
@@ -398,6 +424,10 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
 
       wsiz = write(tr_ofd, tr_obuf, tr_opos);
       if (wsiz == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
         perror("write");
         return EXIT_FAILURE;
       }
