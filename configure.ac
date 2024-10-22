@@ -4,7 +4,7 @@
 AC_PREREQ([2.71])
 AC_INIT([tuncat],[0.9.3],[mako10k@mk10.org])
 AM_INIT_AUTOMAKE([foreign])
-AC_CONFIG_SRCDIR([tuncat.c])
+AC_CONFIG_SRCDIR([src/tuncat.c])
 AC_CONFIG_HEADERS([config.h])
 
 
@@ -27,6 +27,6 @@ AC_FUNC_ALLOCA
 AC_FUNC_FORK
 AC_CHECK_FUNCS([memmove memset select socket])
 
-AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile])
 AC_CONFIG_FILES([tuncat.spec])
 AC_OUTPUT
