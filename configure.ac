@@ -1,17 +1,18 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-AC_PREREQ([2.63])
-AC_INIT([tuncat], [0.9.3], [mako10k@mk10.org])
+AC_PREREQ([2.71])
+AC_INIT([tuncat],[0.9.3],[mako10k@mk10.org])
 AM_INIT_AUTOMAKE([foreign])
 AC_CONFIG_SRCDIR([tuncat.c])
 AC_CONFIG_HEADERS([config.h])
+
 
 # Checks for programs.
 AC_PROG_CC
 
 # Checks for libraries.
-AC_CHECK_LIB([snappy], [main])
+PKG_CHECK_MODULES(SNAPPY, [snappy])
 
 # Checks for header files.
 AC_CHECK_HEADERS([fcntl.h netinet/in.h netdb.h sys/socket.h stdlib.h string.h sys/ioctl.h unistd.h snappy-c.h])
