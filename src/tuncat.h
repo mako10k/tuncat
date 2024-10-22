@@ -1,12 +1,18 @@
 #ifndef __TUNCAT_H__
 #define __TUNCAT_H__
 
+#ifdef HAVE_CONFIG_H
 #include "config.h"
+#else
+#define PACKAGE "tuncat"
+#define VERSION "0.1"
+#define PACKAGE_STRING PACKAGE " " VERSION
+#endif
 
 #include <stdio.h>
 
 #define IF_BUFFER_SIZE 65536
-#define TR_BUFFER_SIZE(siz) (snappy_max_compressed_length(siz)+2)
+#define TR_BUFFER_SIZE(siz) (snappy_max_compressed_length(siz) + 2)
 
 #define IFMODE_TUN 1
 #define IFMODE_TAP 2
@@ -33,8 +39,7 @@
 
 #define COMPFLAG_COMPRESS 1
 
-struct tuncat_opts
-{
+struct tuncat_opts {
   int ifmode;
   char *ifname;
   char *brname;
@@ -46,6 +51,6 @@ struct tuncat_opts
   int compflag;
 };
 
-void print_usage (FILE *, int, char *const[]);
+void print_usage(FILE *, int, char *const[]);
 
 #endif
