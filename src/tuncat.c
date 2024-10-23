@@ -57,7 +57,7 @@ static int inet6_net_pton(int af, const char *cp, void *buf, size_t len) {
     return -1;
   }
 end:
-  memcpy(buf, &addr6, sizeof(addr6));
+  memcpy(buf, &addr6, len < sizeof(addr6) ? len : sizeof(addr6));
   return bits;
 }
 
@@ -73,6 +73,7 @@ static int inet_net_pton_orig(int af, const char *cp, void *buf, size_t len) {
 #define inet_net_pton inet_net_pton_orig
 
 void print_usage(FILE *fp, int argc, char *const argv[]) {
+  (void)argc;
   fprintf(fp, "\n");
   fprintf(fp, "Usage:\n");
   fprintf(fp, "  %s [options]\n", argv[0]);
@@ -252,7 +253,10 @@ void cleanbr() {
   }
 }
 
-void cleanbr_sig(int sig) { cleanbr(); }
+void cleanbr_sig(int sig) {
+  (void)sig;
+  cleanbr();
+}
 
 int convert_bits_to_netmask(int family, int bits, void *mask) {
   if (family == AF_INET) {
@@ -288,7 +292,6 @@ int convert_bits_to_netmask(int family, int bits, void *mask) {
 int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
   struct in6_ifreq ifr6;
   struct in6_addr addr6;
-  socklen_t addrlen6;
 
   memset(&addr6, 0, sizeof(addr6));
   int masksize = inet_net_pton(AF_INET6, addrstr, &addr6, sizeof(addr6));
@@ -381,12 +384,14 @@ int init_if(struct tuncat_opts *optsp) {
   const char *tunname = optsp->ifname;
 
   if (optsp->brname == NULL) {
-    if (set_ifaddr(sock, optsp->ifname, optsp->addr) < 0) {
-      return EXIT_FAILURE;
+    if (optsp->addr != NULL) {
+      if (set_ifaddr(sock, optsp->ifname, optsp->addr) < 0) {
+        return EXIT_FAILURE;
+      }
     }
 
   } else {
-    int ifindex, brindex;
+    int brindex;
 
     brindex = get_ifindex(sock, optsp->brname);
     if (brindex == 0) {
@@ -410,14 +415,14 @@ int init_if(struct tuncat_opts *optsp) {
       return EXIT_FAILURE;
     }
 
-    if (optsp->addr) {
+    if (optsp->addr != NULL) {
       if (set_ifaddr(sock, optsp->brname, optsp->addr) < 0) {
         return EXIT_FAILURE;
       }
     }
 
     if (optsp->braddifname) {
-      int i, len = strlen(optsp->braddifname);
+      int len = strlen(optsp->braddifname);
       char *braddifname = alloca(len + 1);
       char *ifname, *ifn;
 
@@ -444,10 +449,11 @@ int init_if(struct tuncat_opts *optsp) {
 
 int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
                     int tunfd, int tr_ifd, int tr_ofd) {
+  (void)argc;
+  (void)argv;
   size_t if_isiz, if_osiz, tr_isiz, tr_osiz;
   char *if_ibuf, *if_obuf, *tr_ibuf, *tr_obuf;
   int if_ifd, if_ofd;
-  struct ifreq ifr;
   size_t if_ipos, if_opos, tr_ipos, tr_opos;
   int compflag;
 
