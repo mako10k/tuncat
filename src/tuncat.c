@@ -7,9 +7,12 @@
 #include <getopt.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/sockios.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <snappy-c.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +41,12 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
           strcmp(IFMODE_DEFAULT_OPT, IFMODE_TAP_OPT) == 0 ? " (default)" : "");
   fprintf(fp, "  -b,--bridge-name=<name>     Bridge interface (L2 payload)\n");
   fprintf(fp, "  -i,--bridge-members=<ifname>[,<if_name>...]\n");
-  fprintf(fp, "                              Bridge members   (L2 payload)\n");
+  fprintf(
+      fp,
+      "                              Bridge members   (only with bridge)\n");
+  fprintf(
+      fp,
+      "  -B,--bridge-address=<addr>  Bridge address   (only with bridge)\n");
   fprintf(fp, "  -t,--userspace-mode=%-6s  Stdio mode%s\n", TRMODE_STDIO_OPT,
           strcmp(TRMODE_DEFAULT_OPT, TRMODE_STDIO_OPT) == 0 ? "       (default)"
                                                             : "");
@@ -72,41 +80,353 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp, "\n");
 }
 
+int change_ifflags(int sock, char *ifname, int flags_clear, int flags_set) {
+  struct ifreq ifr;
+
+  memset(&ifr, 0, sizeof(ifr));
+  strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+  if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+    perror("Cannot get interface flags");
+    return -1;
+  }
+  typeof(ifr.ifr_flags) flags_new = (ifr.ifr_flags & ~flags_clear) | flags_set;
+  if (flags_new != ifr.ifr_flags) {
+    ifr.ifr_flags = flags_new;
+    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
+      perror("Cannot set interface flags");
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int create_tunif(int sock, char *ifname, int ifmode) {
+  int fd;
+  struct ifreq ifr;
+
+  if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
+    perror("open");
+    return -1;
+  }
+
+  memset(&ifr, 0, sizeof(ifr));
+  ifr.ifr_flags = IFF_TUN;
+  if (ifmode == IFMODE_TUN)
+    ifr.ifr_flags = IFF_TUN;
+  if (ifmode == IFMODE_TAP)
+    ifr.ifr_flags = IFF_TAP;
+
+  if (ifname) {
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+  }
+  if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
+    perror("Error while creating tunnel interface");
+    return -1;
+  }
+
+  if (change_ifflags(sock, ifr.ifr_name, 0, IFF_UP | IFF_RUNNING) < 0) {
+    return -1;
+  }
+
+  return fd;
+}
+
+int get_ifindex(int sock, const char *ifname) {
+  struct ifreq ifr;
+
+  memset(&ifr, 0, sizeof(ifr));
+  strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+  if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
+    return 0;
+  }
+
+  return ifr.ifr_ifindex;
+}
+
+int create_bridge(int sock, char *brname) {
+  struct ifreq ifr;
+
+  memset(&ifr, 0, sizeof(ifr));
+  strncpy(ifr.ifr_name, brname, IFNAMSIZ);
+  if (ioctl(sock, SIOCBRADDBR, &ifr) < 0) {
+    perror("Cannot create bridge device");
+    return -1;
+  }
+
+  return 0;
+}
+
+int delete_bridge(int sock, char *brname) {
+  struct ifreq ifr;
+
+  memset(&ifr, 0, sizeof(ifr));
+  strncpy(ifr.ifr_name, brname, IFNAMSIZ);
+  if (ioctl(sock, SIOCBRDELBR, &ifr) < 0) {
+    perror("Cannot delete bridge device");
+    return -1;
+  }
+
+  return 0;
+}
+
+int add_bridge_member(int sock, const char *brname, const char *ifname) {
+  struct ifreq ifr;
+
+  memset(&ifr, 0, sizeof(ifr));
+  strncpy(ifr.ifr_name, brname, IFNAMSIZ);
+  ifr.ifr_ifindex = get_ifindex(sock, ifname);
+  if (ifr.ifr_ifindex == 0) {
+    fprintf(stderr, "Cannot get interface index\n");
+    return -1;
+  }
+  if (ioctl(sock, SIOCBRADDIF, &ifr) < 0) {
+    perror("Cannot append interface to bridge device");
+    return -1;
+  }
+
+  return 0;
+}
+
 char *brname = NULL;
 
 void cleanbr() {
   if (brname) {
-    struct ifreq ifr;
     int sock;
 
     if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
       perror("socket");
       return;
     }
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, brname, IFNAMSIZ);
-    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-      perror("Cannot get bridge device flags");
-      return;
-    }
-    if ((ifr.ifr_flags & IFF_UP) == 0) {
-      ifr.ifr_flags &= ~IFF_UP;
-      if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-        perror("Cannot set bridge device flags");
-        return;
-      }
-    }
-    if (ioctl(sock, SIOCBRDELBR, brname) < 0) {
-      perror("Cannot delete bridge device");
-    }
+    change_ifflags(sock, brname, IFF_UP, 0);
+    delete_bridge(sock, brname);
+    close(sock);
   }
 }
 
+void cleanbr_sig(int sig) { cleanbr(); }
+
+int convert_bits_to_netmask(int family, int bits, void *mask) {
+  if (family == AF_INET) {
+    if (bits < 0 || bits > 32) {
+      return -1;
+    }
+    struct in_addr *mask4 = mask;
+    mask4->s_addr = htonl(~((1 << (32 - bits)) - 1));
+  } else if (family == AF_INET6) {
+    if (bits < 0 || bits > 128) {
+      return -1;
+    }
+    struct in6_addr *mask6 = mask;
+    int i;
+    for (i = 0; i < 16; i++) {
+      if (bits >= 8) {
+        mask6->s6_addr[i] = 0xff;
+        bits -= 8;
+      } else if (bits > 0) {
+        mask6->s6_addr[i] = 0xff << (8 - bits);
+        bits = 0;
+      } else {
+        mask6->s6_addr[i] = 0;
+      }
+    }
+  } else {
+    return -1;
+  }
+
+  return 0;
+}
+
+int set_ifaddr6(int sock6, const char *ifname, const char *addrstr,
+                const char *maskstr) {
+  struct in6_ifreq ifr6;
+  struct in6_addr addr6, mask6;
+  socklen_t addrlen6;
+
+  if (maskstr == NULL) {
+    maskstr = addrstr;
+    const char *slash = strchr(addrstr, '/');
+    if (slash != NULL) {
+      char *addrstr_new = alloca(slash - addrstr + 1);
+      strncpy(addrstr_new, addrstr, slash - addrstr);
+      addrstr_new[slash - addrstr] = '\0';
+      addrstr = addrstr_new;
+    }
+  }
+
+  memset(&addr6, 0, sizeof(addr6));
+  int masksize = inet_net_pton(AF_INET6, addrstr, &addr6, sizeof(addr6));
+  if (masksize < 0) {
+    fprintf(stderr, "Invalid address\n");
+    return -1;
+  }
+
+  memset(&mask6, 0, sizeof(mask6));
+  if (convert_bits_to_netmask(AF_INET6, masksize, &mask6) < 0) {
+    fprintf(stderr, "Invalid mask\n");
+    return -1;
+  }
+
+  int ifindex = get_ifindex(sock6, ifname);
+  if (ifindex == 0) {
+    fprintf(stderr, "Cannot get interface index\n");
+    return -1;
+  }
+
+  memset(&ifr6, 0, sizeof(ifr6));
+  ifr6.ifr6_ifindex = ifindex;
+  memcpy(&ifr6.ifr6_addr, &addr6, sizeof(addr6));
+  if (ioctl(sock6, SIOCSIFADDR, (void *)&ifr6) < 0) {
+    perror("Cannot set interface address");
+    return -1;
+  }
+  if (ioctl(sock6, SIOCSIFNETMASK, (void *)&ifr6) < 0) {
+    perror("Cannot set interface netmask");
+    return -1;
+  }
+
+  return 0;
+}
+
+int set_ifaddr(int sock, const char *ifname, const char *addrstr,
+               const char *maskstr) {
+  struct ifreq ifr;
+  struct sockaddr_in addr, mask;
+
+  if (maskstr == NULL) {
+    maskstr = addrstr;
+    const char *slash = strchr(addrstr, '/');
+    if (slash != NULL) {
+      char *addrstr_new = alloca(slash - addrstr + 1);
+      strncpy(addrstr_new, addrstr, slash - addrstr);
+      addrstr_new[slash - addrstr] = '\0';
+      addrstr = addrstr_new;
+    }
+  }
+
+  do {
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    int masklen =
+        inet_net_pton(AF_INET, maskstr, &addr.sin_addr, sizeof(addr.sin_addr));
+    if (masklen < 0) {
+      break;
+    }
+    memset(&mask, 0, sizeof(mask));
+    mask.sin_family = AF_INET;
+    mask.sin_port = 0;
+    if (convert_bits_to_netmask(AF_INET, masklen, &mask.sin_addr) < 0) {
+      break;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+    memcpy(&ifr.ifr_addr, &addr, sizeof(addr));
+    if (ioctl(sock, SIOCSIFADDR, (void *)&ifr) < 0) {
+      perror("Cannot set interface address");
+      return -1;
+    }
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+    memcpy(&ifr.ifr_addr, &mask, sizeof(mask));
+    if (ioctl(sock, SIOCSIFNETMASK, (void *)&ifr) < 0) {
+      perror("Cannot set interface netmask");
+      return -1;
+    }
+
+    return 0;
+  } while (0);
+
+  int sock6 = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (sock6 < 0) {
+    perror("socket");
+    return -1;
+  }
+  if (set_ifaddr6(sock6, ifname, addrstr, maskstr) < 0) {
+    close(sock6);
+    return -1;
+  }
+  close(sock6);
+
+  return 0;
+}
+
+int init_if(struct tuncat_opts *optsp) {
+  int sock = socket(PF_INET, SOCK_DGRAM, 0);
+  if (sock == -1) {
+    perror("socket");
+    return EXIT_FAILURE;
+  }
+
+  int tunfd = create_tunif(sock, optsp->ifname, optsp->ifmode);
+  if (tunfd == -1) {
+    return EXIT_FAILURE;
+  }
+  const char *tunname = optsp->ifname;
+
+  if (optsp->brname != NULL) {
+    int ifindex, brindex;
+
+    brindex = get_ifindex(sock, optsp->brname);
+    if (brindex == 0) {
+      brindex = create_bridge(sock, optsp->brname);
+      if (brindex == -1) {
+        return EXIT_FAILURE;
+      }
+      brname = optsp->brname;
+      atexit(cleanbr);
+      struct sigaction sa;
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_handler = cleanbr;
+      sigaction(SIGINT, &sa, NULL);
+      sigaction(SIGTERM, &sa, NULL);
+    }
+
+    if (change_ifflags(sock, optsp->brname, 0, IFF_UP | IFF_RUNNING) < 0) {
+      return EXIT_FAILURE;
+    }
+    if (add_bridge_member(sock, optsp->brname, tunname) < 0) {
+      return EXIT_FAILURE;
+    }
+
+    if (optsp->braddr) {
+      if (set_ifaddr(sock, optsp->brname, optsp->braddr, NULL) < 0) {
+        return EXIT_FAILURE;
+      }
+    }
+
+    if (optsp->braddifname) {
+      int i, len = strlen(optsp->braddifname);
+      char *braddifname = alloca(len + 1);
+      char *ifname, *ifn;
+
+      ifname = strcpy(braddifname, optsp->braddifname);
+      for (;;) {
+        if ((ifn = strchr(ifname, ','))) {
+          *ifn = '\0';
+        }
+        if (add_bridge_member(sock, brname, ifname) < 0) {
+          return EXIT_FAILURE;
+        }
+        if (!ifn) {
+          break;
+        }
+        ifname = ifn + 1;
+      }
+    }
+
+    close(sock);
+  }
+
+  return tunfd;
+}
+
 int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
-                    int tr_ifd, int tr_ofd) {
+                    int tunfd, int tr_ifd, int tr_ofd) {
   size_t if_isiz, if_osiz, tr_isiz, tr_osiz;
   char *if_ibuf, *if_obuf, *tr_ibuf, *tr_obuf;
-  int fd, if_ifd, if_ofd;
+  int if_ifd, if_ofd;
   struct ifreq ifr;
   size_t if_ipos, if_opos, tr_ipos, tr_opos;
   int compflag;
@@ -123,121 +443,7 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
   tr_ibuf = alloca(tr_isiz);
   tr_obuf = alloca(tr_osiz);
 
-  if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
-    perror("open");
-    return EXIT_FAILURE;
-  }
-
-  memset(&ifr, 0, sizeof(ifr));
-  ifr.ifr_flags = IFF_TUN;
-  if (optsp->ifmode == IFMODE_TUN)
-    ifr.ifr_flags = IFF_TUN;
-  if (optsp->ifmode == IFMODE_TAP)
-    ifr.ifr_flags = IFF_TAP;
-
-  if (optsp->ifname) {
-    strncpy(ifr.ifr_name, optsp->ifname, IFNAMSIZ);
-  }
-  if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
-    perror("Error while creating tunnel interface");
-    return EXIT_FAILURE;
-  }
-
-  {
-    int sock = socket(PF_INET, SOCK_DGRAM, 0);
-    if (sock == -1) {
-      perror("socket");
-      return EXIT_FAILURE;
-    }
-
-    if (ioctl(sock, SIOCGIFFLAGS, (void *)&ifr) < 0) {
-      perror("ioctl(SIOCGIFFLAGS)");
-      return EXIT_FAILURE;
-    }
-
-    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-    if (ioctl(sock, SIOCSIFFLAGS, (void *)&ifr) < 0) {
-      perror("ioctl(SIOCSIFFLAGS)");
-      return EXIT_FAILURE;
-    }
-
-    if (optsp->brname != NULL) {
-      int ifindex, brindex;
-
-      ifindex = if_nametoindex(ifr.ifr_name);
-      if (ifindex == 0) {
-        fprintf(stderr, "if_nametoindex(\"%s\")\n", ifr.ifr_name);
-        return EXIT_FAILURE;
-      }
-
-      brindex = if_nametoindex(optsp->brname);
-      if (brindex == 0) {
-        if (ioctl(sock, SIOCBRADDBR, optsp->brname) < 0) {
-          perror("Cannot create bridge device");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-        brname = optsp->brname;
-        atexit(cleanbr);
-      }
-
-      memset(&ifr, 0, sizeof(ifr));
-      strncpy(ifr.ifr_name, optsp->brname, IFNAMSIZ);
-
-      if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-        perror("Cannot get bridge device flags");
-        print_usage(stderr, argc, argv);
-        return EXIT_FAILURE;
-      }
-      if ((ifr.ifr_flags & IFF_UP) == 0) {
-        ifr.ifr_flags |= IFF_UP;
-        if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-          perror("Cannot set bridge device flags");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-      }
-      ifr.ifr_ifindex = ifindex;
-      if (ioctl(sock, SIOCBRADDIF, (void *)&ifr) < 0) {
-        perror("Invalid bridge device");
-        print_usage(stderr, argc, argv);
-        return EXIT_FAILURE;
-      }
-      if (optsp->braddifname) {
-        int i, len = strlen(optsp->braddifname);
-        char *braddifname = alloca(len + 1);
-        char *ifname, *ifn;
-
-        ifname = strcpy(braddifname, optsp->braddifname);
-        for (;;) {
-          if ((ifn = strchr(ifname, ','))) {
-            *ifn = '\0';
-          }
-          ifindex = if_nametoindex(ifname);
-          if (ifindex == 0) {
-            fprintf(stderr, "if_nametoindex(\"%s\")\n", ifname);
-            return EXIT_FAILURE;
-          }
-          memset(&ifr, 0, sizeof(ifr));
-          strncpy(ifr.ifr_name, optsp->brname, IFNAMSIZ);
-          ifr.ifr_ifindex = ifindex;
-          if (ioctl(sock, SIOCBRADDIF, (void *)&ifr) < 0) {
-            char *mes = alloca(256 + strlen(ifname) + strlen(ifr.ifr_name));
-            sprintf(mes, "warn: cannot append %s to %s", ifname, ifr.ifr_name);
-            perror(mes);
-          }
-          if (!ifn) {
-            break;
-          }
-          ifname = ifn + 1;
-        }
-      }
-    }
-
-    close(sock);
-  }
-
-  if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+  if (fcntl(tunfd, F_SETFL, O_NONBLOCK) == -1) {
     perror("fcntl");
     return EXIT_FAILURE;
   }
@@ -250,8 +456,8 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
     return EXIT_FAILURE;
   }
 
-  if_ifd = fd;
-  if_ofd = fd;
+  if_ifd = tunfd;
+  if_ofd = tunfd;
 
   if_ipos = 0;
   if_opos = 0;
@@ -451,6 +657,7 @@ int main(int argc, char *const argv[]) {
       {"tunnel-mode", required_argument, NULL, 'm'},
       {"bridge-name", required_argument, NULL, 'b'},
       {"bridge-members", required_argument, NULL, 'i'},
+      {"bridge-addresses", required_argument, NULL, 'B'},
       {"userspace-mode", required_argument, NULL, 't'},
       {"address", required_argument, NULL, 'l'},
       {"port", required_argument, NULL, 'p'},
@@ -465,7 +672,7 @@ int main(int argc, char *const argv[]) {
   memset(&opts, 0, sizeof(opts));
 
   int optindex = 0;
-  while ((opt = getopt_long(argc, argv, "m:n:b:i:t:l:p:46cvh", longopts,
+  while ((opt = getopt_long(argc, argv, "m:n:b:i:B:t:l:p:46cvh", longopts,
                             &optindex)) != -1) {
     switch (opt) {
     case 'm':
@@ -507,6 +714,14 @@ int main(int argc, char *const argv[]) {
         return EXIT_FAILURE;
       }
       opts.braddifname = optarg;
+      break;
+    case 'B':
+      if (opts.braddr != NULL) {
+        fprintf(stderr, "Duplicated option -B\n");
+        print_usage(stderr, argc, argv);
+        return EXIT_FAILURE;
+      }
+      opts.braddr = optarg;
       break;
     case 't':
       if (opts.trmode != 0) {
@@ -627,8 +842,19 @@ int main(int argc, char *const argv[]) {
     print_usage(stderr, argc, argv);
     return EXIT_FAILURE;
   }
+
+  if (opts.braddr != NULL && opts.brname == NULL) {
+    fprintf(stderr, "-B is not supported without -b\n");
+    print_usage(stderr, argc, argv);
+    return EXIT_FAILURE;
+  }
+
   if (opts.trmode == TRMODE_STDIO) {
-    return forward_packets(argc, argv, &opts, 0, 1);
+    int tunfd = init_if(&opts);
+    if (tunfd == -1) {
+      return EXIT_FAILURE;
+    }
+    return forward_packets(argc, argv, &opts, tunfd, 0, 1);
   }
 
   {
@@ -659,6 +885,13 @@ int main(int argc, char *const argv[]) {
       if (sock == -1)
         continue;
       if (opts.trmode == TRMODE_SERVER) {
+        int optval = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval,
+                       sizeof(optval)) == -1) {
+          perror("setsockopt");
+          close(sock);
+          return EXIT_FAILURE;
+        }
         if (bind(sock, rp->ai_addr, rp->ai_addrlen) == 0)
           break;
       } else {
@@ -675,6 +908,12 @@ int main(int argc, char *const argv[]) {
 
     freeaddrinfo(airp);
   }
+
+  int tunfd = init_if(&opts);
+  if (tunfd == -1) {
+    return EXIT_FAILURE;
+  }
+
   if (opts.trmode == TRMODE_SERVER) {
 
     if (listen(sock, 5) == -1) {
@@ -706,12 +945,12 @@ int main(int argc, char *const argv[]) {
 
       if (pid == 0) {
         close(sock);
-        return forward_packets(argc, argv, &opts, csock, csock);
+        return forward_packets(argc, argv, &opts, tunfd, csock, csock);
       }
 
       close(csock);
     }
   } else {
-    return forward_packets(argc, argv, &opts, sock, sock);
+    return forward_packets(argc, argv, &opts, tunfd, sock, sock);
   }
 }

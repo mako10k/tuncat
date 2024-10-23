@@ -12,6 +12,7 @@ AC_CONFIG_HEADERS([config.h])
 AC_PROG_CC
 
 # Checks for libraries.
+AC_CHECK_LIB(resolv, [inet_net_pton])
 PKG_CHECK_MODULES(SNAPPY, [snappy])
 
 # Checks for header files.
