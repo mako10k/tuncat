@@ -42,9 +42,9 @@
 struct tuncat_opts {
   int ifmode;
   char *ifname;
+  char *addr;
   char *brname;
   char *braddifname;
-  char *braddr;
   int trmode;
   char *node;
   char *port;

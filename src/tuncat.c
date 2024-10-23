@@ -27,6 +27,51 @@
 
 #include "tuncat.h"
 
+static int inet6_net_pton(int af, const char *cp, void *buf, size_t len) {
+  if (af != AF_INET6) {
+    errno = EAFNOSUPPORT;
+    return -1;
+  }
+
+  char _buf[INET6_ADDRSTRLEN + sizeof("/128")];
+  strncpy(_buf, cp, sizeof(_buf) - 1);
+  char *sep = strchr(_buf, '/');
+  if (sep != NULL) {
+    *sep++ = '\0';
+  }
+  struct in6_addr addr6;
+  if (inet_pton(af, _buf, &addr6) != 1) {
+    errno = ENOENT;
+    return -1;
+  }
+
+  long bits = 128;
+  if (sep == NULL) {
+    goto end;
+  }
+
+  char *p;
+  bits = strtol(sep, &p, 10);
+  if (*p != '\0' || bits < 0 || bits > 128) {
+    errno = EINVAL;
+    return -1;
+  }
+end:
+  memcpy(buf, &addr6, sizeof(addr6));
+  return bits;
+}
+
+static int inet_net_pton_orig(int af, const char *cp, void *buf, size_t len) {
+  if (af == AF_INET)
+    return inet_net_pton(af, cp, buf, len);
+  if (af == AF_INET6)
+    return inet6_net_pton(af, cp, buf, len);
+  errno = EAFNOSUPPORT;
+  return -1;
+}
+
+#define inet_net_pton inet_net_pton_orig
+
 void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp, "\n");
   fprintf(fp, "Usage:\n");
@@ -34,27 +79,30 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp, "\n");
   fprintf(fp, "Options:\n");
   fprintf(fp, "  -n,--ifname=<name>          Interface name\n");
+  fprintf(fp,
+          "  -a,--ifaddress=<addr>       Interface address (only with -n)\n");
   fprintf(fp, "\n");
   fprintf(fp, "  -m,--tunnel-mode=%-6s     L3 payload mode%s\n", IFMODE_TUN_OPT,
           strcmp(IFMODE_DEFAULT_OPT, IFMODE_TUN_OPT) == 0 ? "  (default)" : "");
   fprintf(fp, "  -m,--tunnel-mode=%-6s     L2 payload mode%s\n", IFMODE_TAP_OPT,
           strcmp(IFMODE_DEFAULT_OPT, IFMODE_TAP_OPT) == 0 ? " (default)" : "");
+  fprintf(fp, "\n");
   fprintf(fp, "  -b,--bridge-name=<name>     Bridge interface (L2 payload)\n");
   fprintf(fp, "  -i,--bridge-members=<ifname>[,<if_name>...]\n");
   fprintf(
       fp,
       "                              Bridge members   (only with bridge)\n");
-  fprintf(
-      fp,
-      "  -B,--bridge-address=<addr>  Bridge address   (only with bridge)\n");
-  fprintf(fp, "  -t,--userspace-mode=%-6s  Stdio mode%s\n", TRMODE_STDIO_OPT,
+  fprintf(fp, "  -a,--ifaddress=<addr>       Bridge interface address (only "
+              "with -b)\n");
+  fprintf(fp, "\n");
+  fprintf(fp, "  -t,--transfer-mode=%-6s   Stdio mode%s\n", TRMODE_STDIO_OPT,
           strcmp(TRMODE_DEFAULT_OPT, TRMODE_STDIO_OPT) == 0 ? "       (default)"
                                                             : "");
   fprintf(
-      fp, "  -t,--userspace-mode=%-6s  TCP server mode%s\n", TRMODE_SERVER_OPT,
+      fp, "  -t,--transfer-mode=%-6s   TCP server mode%s\n", TRMODE_SERVER_OPT,
       strcmp(TRMODE_DEFAULT_OPT, TRMODE_SERVER_OPT) == 0 ? "  (default)" : "");
   fprintf(
-      fp, "  -t,--userspace-mode=%-6s  TCP client mode%s\n", TRMODE_CLIENT_OPT,
+      fp, "  -t,--transfer-mode=%-6s   TCP client mode%s\n", TRMODE_CLIENT_OPT,
       strcmp(TRMODE_DEFAULT_OPT, TRMODE_CLIENT_OPT) == 0 ? "  (default)" : "");
   fprintf(fp, "  -l,--address=<addr>         Listen Address   (default: any) "
               "  (TCP server)\n");
@@ -237,33 +285,15 @@ int convert_bits_to_netmask(int family, int bits, void *mask) {
   return 0;
 }
 
-int set_ifaddr6(int sock6, const char *ifname, const char *addrstr,
-                const char *maskstr) {
+int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
   struct in6_ifreq ifr6;
-  struct in6_addr addr6, mask6;
+  struct in6_addr addr6;
   socklen_t addrlen6;
-
-  if (maskstr == NULL) {
-    maskstr = addrstr;
-    const char *slash = strchr(addrstr, '/');
-    if (slash != NULL) {
-      char *addrstr_new = alloca(slash - addrstr + 1);
-      strncpy(addrstr_new, addrstr, slash - addrstr);
-      addrstr_new[slash - addrstr] = '\0';
-      addrstr = addrstr_new;
-    }
-  }
 
   memset(&addr6, 0, sizeof(addr6));
   int masksize = inet_net_pton(AF_INET6, addrstr, &addr6, sizeof(addr6));
   if (masksize < 0) {
     fprintf(stderr, "Invalid address\n");
-    return -1;
-  }
-
-  memset(&mask6, 0, sizeof(mask6));
-  if (convert_bits_to_netmask(AF_INET6, masksize, &mask6) < 0) {
-    fprintf(stderr, "Invalid mask\n");
     return -1;
   }
 
@@ -276,40 +306,25 @@ int set_ifaddr6(int sock6, const char *ifname, const char *addrstr,
   memset(&ifr6, 0, sizeof(ifr6));
   ifr6.ifr6_ifindex = ifindex;
   memcpy(&ifr6.ifr6_addr, &addr6, sizeof(addr6));
+  ifr6.ifr6_prefixlen = masksize;
   if (ioctl(sock6, SIOCSIFADDR, (void *)&ifr6) < 0) {
     perror("Cannot set interface address");
-    return -1;
-  }
-  if (ioctl(sock6, SIOCSIFNETMASK, (void *)&ifr6) < 0) {
-    perror("Cannot set interface netmask");
     return -1;
   }
 
   return 0;
 }
 
-int set_ifaddr(int sock, const char *ifname, const char *addrstr,
-               const char *maskstr) {
+int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
   struct ifreq ifr;
   struct sockaddr_in addr, mask;
-
-  if (maskstr == NULL) {
-    maskstr = addrstr;
-    const char *slash = strchr(addrstr, '/');
-    if (slash != NULL) {
-      char *addrstr_new = alloca(slash - addrstr + 1);
-      strncpy(addrstr_new, addrstr, slash - addrstr);
-      addrstr_new[slash - addrstr] = '\0';
-      addrstr = addrstr_new;
-    }
-  }
 
   do {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = 0;
     int masklen =
-        inet_net_pton(AF_INET, maskstr, &addr.sin_addr, sizeof(addr.sin_addr));
+        inet_net_pton(AF_INET, addrstr, &addr.sin_addr, sizeof(addr.sin_addr));
     if (masklen < 0) {
       break;
     }
@@ -343,7 +358,7 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr,
     perror("socket");
     return -1;
   }
-  if (set_ifaddr6(sock6, ifname, addrstr, maskstr) < 0) {
+  if (set_ifaddr6(sock6, ifname, addrstr) < 0) {
     close(sock6);
     return -1;
   }
@@ -365,7 +380,12 @@ int init_if(struct tuncat_opts *optsp) {
   }
   const char *tunname = optsp->ifname;
 
-  if (optsp->brname != NULL) {
+  if (optsp->brname == NULL) {
+    if (set_ifaddr(sock, optsp->ifname, optsp->addr) < 0) {
+      return EXIT_FAILURE;
+    }
+
+  } else {
     int ifindex, brindex;
 
     brindex = get_ifindex(sock, optsp->brname);
@@ -390,8 +410,8 @@ int init_if(struct tuncat_opts *optsp) {
       return EXIT_FAILURE;
     }
 
-    if (optsp->braddr) {
-      if (set_ifaddr(sock, optsp->brname, optsp->braddr, NULL) < 0) {
+    if (optsp->addr) {
+      if (set_ifaddr(sock, optsp->brname, optsp->addr) < 0) {
         return EXIT_FAILURE;
       }
     }
@@ -654,11 +674,11 @@ int main(int argc, char *const argv[]) {
   struct tuncat_opts opts;
   struct option longopts[] = {
       {"ifname", required_argument, NULL, 'n'},
+      {"ifaddress", required_argument, NULL, 'a'},
       {"tunnel-mode", required_argument, NULL, 'm'},
       {"bridge-name", required_argument, NULL, 'b'},
       {"bridge-members", required_argument, NULL, 'i'},
-      {"bridge-addresses", required_argument, NULL, 'B'},
-      {"userspace-mode", required_argument, NULL, 't'},
+      {"transfer-mode", required_argument, NULL, 't'},
       {"address", required_argument, NULL, 'l'},
       {"port", required_argument, NULL, 'p'},
       {"ipv4", no_argument, NULL, '4'},
@@ -672,7 +692,7 @@ int main(int argc, char *const argv[]) {
   memset(&opts, 0, sizeof(opts));
 
   int optindex = 0;
-  while ((opt = getopt_long(argc, argv, "m:n:b:i:B:t:l:p:46cvh", longopts,
+  while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46cvh", longopts,
                             &optindex)) != -1) {
     switch (opt) {
     case 'm':
@@ -699,6 +719,14 @@ int main(int argc, char *const argv[]) {
       }
       opts.ifname = optarg;
       break;
+    case 'a':
+      if (opts.addr != NULL) {
+        fprintf(stderr, "Duplicated option -a\n");
+        print_usage(stderr, argc, argv);
+        return EXIT_FAILURE;
+      }
+      opts.addr = optarg;
+      break;
     case 'b':
       if (opts.brname != NULL) {
         fprintf(stderr, "Duplicated option -b\n");
@@ -714,14 +742,6 @@ int main(int argc, char *const argv[]) {
         return EXIT_FAILURE;
       }
       opts.braddifname = optarg;
-      break;
-    case 'B':
-      if (opts.braddr != NULL) {
-        fprintf(stderr, "Duplicated option -B\n");
-        print_usage(stderr, argc, argv);
-        return EXIT_FAILURE;
-      }
-      opts.braddr = optarg;
       break;
     case 't':
       if (opts.trmode != 0) {
@@ -839,12 +859,6 @@ int main(int argc, char *const argv[]) {
 
   if (opts.braddifname != NULL && opts.brname == NULL) {
     fprintf(stderr, "-i is not supported without -b\n");
-    print_usage(stderr, argc, argv);
-    return EXIT_FAILURE;
-  }
-
-  if (opts.braddr != NULL && opts.brname == NULL) {
-    fprintf(stderr, "-B is not supported without -b\n");
     print_usage(stderr, argc, argv);
     return EXIT_FAILURE;
   }
