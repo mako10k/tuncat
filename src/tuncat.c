@@ -370,7 +370,7 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
   return 0;
 }
 
-int init_if(struct tuncat_opts *optsp) {
+int init_if(struct tuncat_commandline_options *optsp) {
   int sock = socket(PF_INET, SOCK_DGRAM, 0);
   if (sock == -1) {
     perror("socket");
@@ -447,8 +447,17 @@ int init_if(struct tuncat_opts *optsp) {
   return tunfd;
 }
 
-int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
-                    int tunfd, int tr_ifd, int tr_ofd) {
+#define PACKET_SIZELEN 2
+
+static int read_packet_size(const char *buf) { return ntohs(*(uint16_t *)buf); }
+
+static void write_packet_size(char *buf, int size) {
+  *(uint16_t *)buf = htons(size);
+}
+
+int forward_packets(int argc, char *const argv[],
+                    struct tuncat_commandline_options *optsp, int tunfd,
+                    int tr_ifd, int tr_ofd) {
   (void)argc;
   (void)argv;
   size_t if_isiz, if_osiz, tr_isiz, tr_osiz;
@@ -502,60 +511,55 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
     if (if_ipos > 0) // IIB is not empty
     {
       size_t tr_oavl = tr_osiz - tr_opos; // TOB writable size
-      size_t tr_csiz = compflag ? 2 + snappy_max_compressed_length(if_ipos)
-                                : if_ipos; // TOB requirement size
+      size_t tr_csiz =
+          compflag ? TR_BUFFER_SIZE(if_ipos) : if_ipos; // TOB requirement size
       if (tr_oavl >= tr_csiz) {
         size_t opos;
 
         if (compflag) {
-          opos = tr_oavl - 2;
-          if (snappy_compress(if_ibuf, if_ipos, tr_obuf + tr_opos + 2, &opos) !=
-              SNAPPY_OK) {
+          opos = tr_oavl - PACKET_SIZELEN;
+          if (snappy_compress(if_ibuf, if_ipos,
+                              tr_obuf + tr_opos + PACKET_SIZELEN,
+                              &opos) != SNAPPY_OK) {
             fprintf(stderr, "Fatal: snappy_compress failed\n");
             return EXIT_FAILURE;
           }
         } else {
-          memcpy(tr_obuf + tr_opos + 2, if_ibuf, if_ipos);
+          memcpy(tr_obuf + tr_opos + PACKET_SIZELEN, if_ibuf, if_ipos);
           opos = if_ipos;
         }
-        // fprintf(stderr, "IIB(%u) -> TOB(%u) (compress: %u)\n", if_ipos,
-        // tr_opos, 2 + opos);
-        *(tr_obuf + tr_opos + 0) = opos >> 8;
-        *(tr_obuf + tr_opos + 1) = opos & 255;
-        tr_opos += 2 + opos;
+        write_packet_size(tr_obuf, opos);
+        tr_opos += PACKET_SIZELEN + opos;
         if_ipos = 0;
         continue;
       }
     }
 
-    if (if_opos == 0 && tr_ipos >= 2) {
+    if (if_opos == 0 && tr_ipos >= PACKET_SIZELEN) {
       size_t ipos;
 
-      ipos = (*((unsigned char *)tr_ibuf + 0) << 8) +
-             (*((unsigned char *)tr_ibuf + 1) & 255);
-      // fprintf(stderr, "Input Transfer Packet Size : %u(Received: %d)\n",
-      // ipos, tr_ipos);
-      if (tr_ipos >= 2 + ipos) {
+      ipos = read_packet_size(tr_ibuf);
+      if (tr_ipos >= PACKET_SIZELEN + ipos) {
         size_t osiz;
 
         if (compflag) {
           osiz = if_osiz;
-          if (snappy_uncompress(tr_ibuf + 2, ipos, if_obuf, &osiz) !=
-              SNAPPY_OK) {
+          if (snappy_uncompress(tr_ibuf + PACKET_SIZELEN, ipos, if_obuf,
+                                &osiz) != SNAPPY_OK) {
             fprintf(stderr, "Warn: Invalid transfer input stream\n");
             tr_ipos = 0; // reset TIB
             continue;
           }
         } else {
-          memcpy(if_obuf, tr_ibuf + 2, ipos);
+          memcpy(if_obuf, tr_ibuf + PACKET_SIZELEN, ipos);
           osiz = ipos;
         }
         // fprintf(stderr, "TIB(%u) -> IOB(%u) (uncompress: %u)\n", tr_ipos,
         // if_opos, osiz);
-        tr_ipos -= ipos + 2;
+        tr_ipos -= ipos + PACKET_SIZELEN;
         if_opos += osiz;
         if (tr_ipos > 0) {
-          memmove(tr_ibuf, tr_ibuf + ipos + 2, tr_ipos);
+          memmove(tr_ibuf, tr_ibuf + ipos + PACKET_SIZELEN, tr_ipos);
         }
         continue;
       }
@@ -604,10 +608,8 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
         return EXIT_FAILURE;
       }
       if (rsiz == 0) {
-        // fprintf (stderr, "II closed\n");
         return EXIT_SUCCESS;
       }
-      // fprintf(stderr, "II(%u) -> IIB(%u)\n", rsiz, if_ipos);
       if_ipos += rsiz;
       continue;
     }
@@ -623,7 +625,6 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
         perror("write");
         return EXIT_FAILURE;
       }
-      // fprintf(stderr, "IOB(%u) -> IO(%u)\n", if_opos, wsiz);
       if_opos -= wsiz;
       if (if_opos > 0) {
         memmove(if_obuf, if_obuf + wsiz, if_opos);
@@ -644,10 +645,8 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
         return EXIT_FAILURE;
       }
       if (rsiz == 0) {
-        // fprintf (stderr, "TI closed\n");
         return EXIT_SUCCESS;
       }
-      // fprintf(stderr, "TI(%u) -> TIB (%u)\n", rsiz, tr_ipos);
       tr_ipos += rsiz;
       continue;
     }
@@ -663,7 +662,6 @@ int forward_packets(int argc, char *const argv[], struct tuncat_opts *optsp,
         perror("write");
         return EXIT_FAILURE;
       }
-      // fprintf(stderr, "TOB(%u) -> TO(%u)\n", tr_opos, wsiz);
       tr_opos -= wsiz;
       if (tr_opos > 0) {
         memmove(tr_obuf, tr_obuf + wsiz, tr_opos);
@@ -677,7 +675,7 @@ int main(int argc, char *const argv[]) {
   int sock;
 
   int opt;
-  struct tuncat_opts opts;
+  struct tuncat_commandline_options opts;
   struct option longopts[] = {
       {"ifname", required_argument, NULL, 'n'},
       {"ifaddress", required_argument, NULL, 'a'},
