@@ -1,5 +1,6 @@
 #include <alloca.h>
 #include <arpa/inet.h>
+#include <assert.h>
 #include <fcntl.h>
 #include <net/if.h> // must be before <linux/if.h>
 
@@ -83,10 +84,10 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp,
           "  -a,--ifaddress=<addr>       Interface address (only with -n)\n");
   fprintf(fp, "\n");
-  fprintf(fp, "  -m,--tunnel-mode=%-6s     L3 payload mode%s\n", IFMODE_TUN_OPT,
-          strcmp(IFMODE_DEFAULT_OPT, IFMODE_TUN_OPT) == 0 ? "  (default)" : "");
-  fprintf(fp, "  -m,--tunnel-mode=%-6s     L2 payload mode%s\n", IFMODE_TAP_OPT,
-          strcmp(IFMODE_DEFAULT_OPT, IFMODE_TAP_OPT) == 0 ? " (default)" : "");
+  fprintf(fp, "  -m,--tunnel-mode=%-6s     L3 payload mode%s\n", IFMODE_L3_OPT,
+          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L3_OPT) == 0 ? "  (default)" : "");
+  fprintf(fp, "  -m,--tunnel-mode=%-6s     L2 payload mode%s\n", IFMODE_L2_OPT,
+          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L2_OPT) == 0 ? " (default)" : "");
   fprintf(fp, "\n");
   fprintf(fp, "  -b,--bridge-name=<name>     Bridge interface (L2 payload)\n");
   fprintf(fp, "  -i,--bridge-members=<ifname>[,<if_name>...]\n");
@@ -124,12 +125,20 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp, "\n");
   fprintf(fp, "  -c,--compress               Compress mode\n");
   fprintf(fp, "\n");
+  fprintf(fp, "  -F,--max-frame-size=<size>  Max frame size (default: %zu)\n",
+          (size_t)IF_MAX_FRAME_SIZE_DEF);
+  fprintf(fp, "  -I,--ifbuffer-size=<size>   Interface buffer size\n");
+  fprintf(fp, "                   (default: <Max frame size> * 2)\n");
+  fprintf(fp, "  -T,--trbuffer-size=<size>   Transfer buffer size\n");
+  fprintf(fp, "                   (default: <Interface Buffersize>)\n");
+  fprintf(fp, "\n");
   fprintf(fp, "  -v,--version                Print version\n");
   fprintf(fp, "  -h,--help                   Print this usage\n");
   fprintf(fp, "\n");
 }
 
-int change_ifflags(int sock, char *ifname, int flags_clear, int flags_set) {
+int change_ifflags(int sock, const char *ifname, int flags_clear,
+                   int flags_set) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
@@ -150,7 +159,7 @@ int change_ifflags(int sock, char *ifname, int flags_clear, int flags_set) {
   return 0;
 }
 
-int create_tunif(int sock, char *ifname, int ifmode) {
+int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
   int fd;
   struct ifreq ifr;
 
@@ -160,11 +169,20 @@ int create_tunif(int sock, char *ifname, int ifmode) {
   }
 
   memset(&ifr, 0, sizeof(ifr));
-  ifr.ifr_flags = IFF_TUN;
-  if (ifmode == IFMODE_TUN)
-    ifr.ifr_flags = IFF_TUN;
-  if (ifmode == IFMODE_TAP)
-    ifr.ifr_flags = IFF_TAP;
+  ifr.ifr_flags = 0;
+  switch (ifmode) {
+  case IFMODE_L2:
+    ifr.ifr_flags |= IFF_TAP;
+    break;
+  case IFMODE_UNSPEC:
+  case IFMODE_L3:
+    ifr.ifr_flags |= IFF_TUN;
+    break;
+  }
+
+#ifdef IFF_NO_PI
+  ifr.ifr_flags |= IFF_NO_PI;
+#endif
 
   if (ifname) {
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
@@ -258,6 +276,38 @@ void cleanbr_sig(int sig) {
   cleanbr();
 }
 
+static int cmp_addr(int family, const void *addr1, const void *addr2) {
+  if (family == AF_INET) {
+    return memcmp(addr1, addr2, sizeof(struct in_addr));
+  } else if (family == AF_INET6) {
+    return memcmp(addr1, addr2, sizeof(struct in6_addr));
+  } else {
+    assert("Invalid family" == NULL);
+  }
+}
+
+static int convert_nworkaddr(const void *addr, int bits, void *broadcastaddr) {
+  if (bits < 0 || bits > 32) {
+    return -1;
+  }
+  struct in_addr *addr4 = (struct in_addr *)addr;
+  struct in_addr *networkaddr4 = (struct in_addr *)broadcastaddr;
+  uint32_t mask = htonl(~((1 << (32 - bits)) - 1));
+  networkaddr4->s_addr = addr4->s_addr & mask;
+  return 0;
+}
+
+static int convert_bcastaddr(const void *addr, int bits, void *broadcastaddr) {
+  if (bits < 0 || bits > 32) {
+    return -1;
+  }
+  struct in_addr *addr4 = (struct in_addr *)addr;
+  struct in_addr *bcastaddr4 = (struct in_addr *)broadcastaddr;
+  uint32_t mask = htonl(~((1 << (32 - bits)) - 1));
+  bcastaddr4->s_addr = (addr4->s_addr & mask) | ~mask;
+  return 0;
+}
+
 int convert_bits_to_netmask(int family, int bits, void *mask) {
   if (family == AF_INET) {
     if (bits < 0 || bits > 32) {
@@ -320,7 +370,7 @@ int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
 
 int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
   struct ifreq ifr;
-  struct sockaddr_in addr, mask;
+  struct sockaddr_in addr, mask, nwork, bcast;
 
   do {
     memset(&addr, 0, sizeof(addr));
@@ -331,11 +381,40 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
     if (masklen < 0) {
       break;
     }
+
     memset(&mask, 0, sizeof(mask));
     mask.sin_family = AF_INET;
     mask.sin_port = 0;
     if (convert_bits_to_netmask(AF_INET, masklen, &mask.sin_addr) < 0) {
       break;
+    }
+
+    memset(&nwork, 0, sizeof(nwork));
+    nwork.sin_family = AF_INET;
+    nwork.sin_port = 0;
+    if (convert_nworkaddr(&addr.sin_addr, masklen, &nwork.sin_addr) < 0) {
+      break;
+    }
+
+    memset(&bcast, 0, sizeof(bcast));
+    bcast.sin_family = AF_INET;
+    bcast.sin_port = 0;
+    if (convert_bcastaddr(&addr.sin_addr, masklen, &bcast.sin_addr) < 0) {
+      break;
+    }
+
+    if (masklen < 31) {
+      // check except netmask is /31 or /31, see RFC 3021
+      if (cmp_addr(AF_INET, &addr.sin_addr, &nwork.sin_addr) == 0) {
+        fprintf(stderr, "Cannot set address as network address\n");
+        break;
+      }
+      if (cmp_addr(AF_INET, &addr.sin_addr, &bcast.sin_addr) == 0) {
+        fprintf(stderr, "Cannot set address as broadcast addr\n");
+        break;
+      }
+    } else if (masklen == 32) {
+      fprintf(stderr, "WARNING: /32 address is not recommended\n");
     }
 
     memset(&ifr, 0, sizeof(ifr));
@@ -345,12 +424,39 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
       perror("Cannot set interface address");
       return -1;
     }
+
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
     memcpy(&ifr.ifr_addr, &mask, sizeof(mask));
     if (ioctl(sock, SIOCSIFNETMASK, (void *)&ifr) < 0) {
       perror("Cannot set interface netmask");
       return -1;
+    }
+
+    if (masklen > 31) {
+      memset(&ifr, 0, sizeof(ifr));
+      strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+      memcpy(&ifr.ifr_addr, &bcast, sizeof(bcast));
+      if (ioctl(sock, SIOCSIFBRDADDR, (void *)&ifr) < 0) {
+        perror("Cannot set interface broadcast address");
+        return -1;
+      }
+      if (change_ifflags(sock, ifname, 0, IFF_BROADCAST) < 0) {
+        return -1;
+      }
+    } else {
+      // IFC-3012 Compliance (/31, /32 address)
+      memset(&ifr, 0, sizeof(ifr));
+      strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+      bcast.sin_addr.s_addr = htonl(INADDR_NONE);
+      memcpy(&ifr.ifr_addr, &bcast, sizeof(bcast));
+      if (ioctl(sock, SIOCSIFBRDADDR, (void *)&ifr) < 0) {
+        perror("Cannot set interface broadcast address");
+        return -1;
+      }
+      if (change_ifflags(sock, ifname, IFF_BROADCAST, 0) < 0) {
+        return -1;
+      }
     }
 
     return 0;
@@ -411,14 +517,15 @@ int init_if(struct tuncat_commandline_options *optsp) {
     if (change_ifflags(sock, optsp->brname, 0, IFF_UP | IFF_RUNNING) < 0) {
       return EXIT_FAILURE;
     }
-    if (add_bridge_member(sock, optsp->brname, tunname) < 0) {
-      return EXIT_FAILURE;
-    }
 
     if (optsp->addr != NULL) {
       if (set_ifaddr(sock, optsp->brname, optsp->addr) < 0) {
         return EXIT_FAILURE;
       }
+    }
+
+    if (add_bridge_member(sock, optsp->brname, tunname) < 0) {
+      return EXIT_FAILURE;
     }
 
     if (optsp->braddifname) {
@@ -447,11 +554,12 @@ int init_if(struct tuncat_commandline_options *optsp) {
   return tunfd;
 }
 
-#define PACKET_SIZELEN 2
+static size_t read_packet_size(const char *buf) {
+  return ntohs(*(uint16_t *)buf);
+}
 
-static int read_packet_size(const char *buf) { return ntohs(*(uint16_t *)buf); }
-
-static void write_packet_size(char *buf, int size) {
+static void write_packet_size(char *buf, size_t size) {
+  assert(size <= 65535);
   *(uint16_t *)buf = htons(size);
 }
 
@@ -460,23 +568,28 @@ int forward_packets(int argc, char *const argv[],
                     int tr_ifd, int tr_ofd) {
   (void)argc;
   (void)argv;
-  size_t if_isiz, if_osiz, tr_isiz, tr_osiz;
-  char *if_ibuf, *if_obuf, *tr_ibuf, *tr_obuf;
-  int if_ifd, if_ofd;
-  size_t if_ipos, if_opos, tr_ipos, tr_opos;
-  int compflag;
 
-  compflag = optsp->compflag == COMPFLAG_COMPRESS;
+  enum compflag compflag = optsp->compflag;
 
-  if_isiz = IF_BUFFER_SIZE;
-  if_osiz = IF_BUFFER_SIZE;
-  tr_isiz = TR_BUFFER_SIZE(if_osiz);
-  tr_osiz = TR_BUFFER_SIZE(if_isiz);
+  size_t max_frame_size = optsp->max_frame_size ?: IF_MAX_FRAME_SIZE_DEF;
 
-  if_ibuf = alloca(if_isiz);
-  if_obuf = alloca(if_osiz);
-  tr_ibuf = alloca(tr_isiz);
-  tr_obuf = alloca(tr_osiz);
+  const size_t if_read_buf_size = optsp->ifbuffer_size ?: 2 * max_frame_size;
+  const size_t if_write_buf_size = optsp->ifbuffer_size ?: 2 * max_frame_size;
+  const size_t tr_recv_buf_size = optsp->trbuffer_size ?: if_write_buf_size;
+  const size_t tr_send_buf_size = optsp->trbuffer_size ?: if_read_buf_size;
+
+  char if_read_buf[if_read_buf_size];
+  char if_write_buf[if_write_buf_size];
+  char tr_recv_buf[tr_recv_buf_size];
+  char tr_send_buf[tr_send_buf_size];
+
+  const int if_read_fd = tunfd;
+  const int if_write_fd = tunfd;
+
+  size_t if_read_buf_pos = 0;
+  size_t if_write_buf_pos = 0;
+  size_t tr_recv_buf_pos = 0;
+  size_t tr_send_buf_pos = 0;
 
   if (fcntl(tunfd, F_SETFL, O_NONBLOCK) == -1) {
     perror("fcntl");
@@ -491,13 +604,14 @@ int forward_packets(int argc, char *const argv[],
     return EXIT_FAILURE;
   }
 
-  if_ifd = tunfd;
-  if_ofd = tunfd;
+  // Transfer Information
+  write_packet_size(&tr_send_buf[tr_send_buf_pos], 0);
+  tr_send_buf_pos += IF_FRAME_SIZE_LEN;
+  tr_send_buf[tr_send_buf_pos++] = optsp->ifmode;
+  tr_send_buf[tr_send_buf_pos++] = optsp->compflag;
+  write_packet_size(&tr_send_buf[tr_send_buf_pos], optsp->max_frame_size);
+  tr_send_buf_pos += IF_FRAME_SIZE_LEN;
 
-  if_ipos = 0;
-  if_opos = 0;
-  tr_ipos = 0;
-  tr_opos = 0;
   for (;;) {
     int nfds;
     fd_set rfds, wfds;
@@ -505,100 +619,227 @@ int forward_packets(int argc, char *const argv[],
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
 
-    // If there is some data on Interface Input Buffer(IIB),
-    // and the IIB has enough space to compress.
-    // then compress and move it to Transport Output Buffer(TOB).
-    if (if_ipos > 0) // IIB is not empty
-    {
-      size_t tr_oavl = tr_osiz - tr_opos; // TOB writable size
-      size_t tr_csiz =
-          compflag ? TR_BUFFER_SIZE(if_ipos) : if_ipos; // TOB requirement size
-      if (tr_oavl >= tr_csiz) {
-        size_t opos;
+    // ---------------------------------------------------
+    // Interface Read Buffer -> Transfer Send Buffer
+    // ---------------------------------------------------
+    while (1) {
 
-        if (compflag) {
-          opos = tr_oavl - PACKET_SIZELEN;
-          if (snappy_compress(if_ibuf, if_ipos,
-                              tr_obuf + tr_opos + PACKET_SIZELEN,
-                              &opos) != SNAPPY_OK) {
-            fprintf(stderr, "Fatal: snappy_compress failed\n");
-            return EXIT_FAILURE;
-          }
-        } else {
-          memcpy(tr_obuf + tr_opos + PACKET_SIZELEN, if_ibuf, if_ipos);
-          opos = if_ipos;
-        }
-        write_packet_size(tr_obuf, opos);
-        tr_opos += PACKET_SIZELEN + opos;
-        if_ipos = 0;
-        continue;
+      // brake if the packet size cannot read from interface read buffer
+      if (if_read_buf_pos < IF_FRAME_SIZE_LEN)
+        break;
+
+      // read packet size from interface read buffer
+      const size_t if_read_packet_size = read_packet_size(if_read_buf);
+
+      // brake if the packet content cannot read from interface read buffer
+      if (if_read_buf_pos < IF_FRAME_SIZE_LEN + if_read_packet_size)
+        break;
+
+      // calculate writing capacity of transfer send buffer
+      const size_t tr_send_buf_writable_size =
+          tr_send_buf_size - tr_send_buf_pos;
+
+      // calculate required size of transfer send buffer
+      size_t tr_send_buf_required_size =
+          IF_FRAME_SIZE_LEN + if_read_packet_size;
+      if (compflag == COMPFLAG_COMPRESS) {
+        // calculate MAX required size of transfer send buffer with compression
+        tr_send_buf_required_size =
+            IF_FRAME_SIZE_LEN +
+            snappy_max_compressed_length(if_read_packet_size);
       }
+
+      // brake if the transfer send buffer cannot store the packet
+      if (tr_send_buf_writable_size < tr_send_buf_required_size)
+        break;
+
+      if (compflag == COMPFLAG_COMPRESS) {
+        // read from interface read buffer, compress and write packet
+
+        size_t compressed_size =
+            tr_send_buf_size - (IF_FRAME_SIZE_LEN + tr_send_buf_pos);
+
+        // compressing the packet
+        if (snappy_compress(&if_read_buf[IF_FRAME_SIZE_LEN],
+                            if_read_packet_size,
+                            &tr_send_buf[IF_FRAME_SIZE_LEN + tr_send_buf_pos],
+                            &compressed_size) != SNAPPY_OK) {
+          fprintf(stderr, "Fatal: snappy_compress failed\n");
+          return EXIT_FAILURE;
+        }
+
+        // write compressed packet size
+        write_packet_size(&tr_send_buf[tr_send_buf_pos], compressed_size);
+
+        // move the position of transfer send buffer
+        tr_send_buf_pos += IF_FRAME_SIZE_LEN + compressed_size;
+
+      } else if (tr_send_buf_writable_size >= tr_send_buf_required_size) {
+
+        // copy packet from interface read buffer to transfer send buffer
+        memcpy(&tr_send_buf[tr_send_buf_pos], if_read_buf,
+               IF_FRAME_SIZE_LEN + if_read_packet_size);
+
+        // move the position of transfer send buffer
+        tr_send_buf_pos += IF_FRAME_SIZE_LEN + if_read_packet_size;
+      }
+
+      // move the following data of interface read buffer
+      memmove(if_read_buf,
+              &if_read_buf[IF_FRAME_SIZE_LEN + if_read_packet_size],
+              if_read_buf_pos - (IF_FRAME_SIZE_LEN + if_read_packet_size));
+      // ^ TODO: should be minimize buffer move
+
+      // move the position of interface read buffer
+      if_read_buf_pos -= IF_FRAME_SIZE_LEN + if_read_packet_size;
     }
 
-    if (if_opos == 0 && tr_ipos >= PACKET_SIZELEN) {
-      size_t ipos;
+    // ---------------------------------------------------
+    // Transfer Recv Buffer -> Interface Write Buffer
+    // ---------------------------------------------------
+    while (1) {
 
-      ipos = read_packet_size(tr_ibuf);
-      if (tr_ipos >= PACKET_SIZELEN + ipos) {
-        size_t osiz;
+      // brake if the packet size cannot read from transfer receive buffer
+      if (tr_recv_buf_pos < IF_FRAME_SIZE_LEN)
+        break;
 
-        if (compflag) {
-          osiz = if_osiz;
-          if (snappy_uncompress(tr_ibuf + PACKET_SIZELEN, ipos, if_obuf,
-                                &osiz) != SNAPPY_OK) {
-            fprintf(stderr, "Warn: Invalid transfer input stream\n");
-            tr_ipos = 0; // reset TIB
-            continue;
-          }
-        } else {
-          memcpy(if_obuf, tr_ibuf + PACKET_SIZELEN, ipos);
-          osiz = ipos;
-        }
-        // fprintf(stderr, "TIB(%u) -> IOB(%u) (uncompress: %u)\n", tr_ipos,
-        // if_opos, osiz);
-        tr_ipos -= ipos + PACKET_SIZELEN;
-        if_opos += osiz;
-        if (tr_ipos > 0) {
-          memmove(tr_ibuf, tr_ibuf + ipos + PACKET_SIZELEN, tr_ipos);
-        }
+      // read packet size from transfer receive buffer
+      const size_t tr_recv_packet_size = read_packet_size(tr_recv_buf);
+
+      // operate information packet
+      if (tr_recv_packet_size == 0) {
+        // 4 byte of transfer information
+        if (tr_recv_buf_pos < IF_FRAME_SIZE_LEN + 4)
+          break;
+        const enum ifmode received_ifmode = tr_recv_buf[IF_FRAME_SIZE_LEN];
+        const enum compflag received_compflag =
+            tr_recv_buf[IF_FRAME_SIZE_LEN + 1];
+        const size_t received_max_frame_size =
+            read_packet_size(&tr_recv_buf[IF_FRAME_SIZE_LEN + 2]);
+        memmove(tr_recv_buf, &tr_recv_buf[IF_FRAME_SIZE_LEN + 4],
+                tr_recv_buf_pos - (IF_FRAME_SIZE_LEN + 4));
+        tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + 4;
+
+        // TODO: check received information
+        (void)received_ifmode;
+        (void)received_compflag;
+        (void)received_max_frame_size;
+
         continue;
       }
+
+      // brake if the packet content cannot read from transfer receive buffer
+      if (tr_recv_buf_pos < IF_FRAME_SIZE_LEN + tr_recv_packet_size)
+        break;
+
+      // calculate writing capacity of interface write buffer
+      const size_t if_write_buf_writable_size =
+          if_write_buf_size - if_write_buf_pos;
+
+      // calculate required size of interface write buffer
+      size_t if_write_buf_required_size =
+          IF_FRAME_SIZE_LEN + tr_recv_packet_size;
+
+      if (compflag == COMPFLAG_COMPRESS) {
+        // calculate required size of interface write buffer with compression
+        size_t uncompressed_size;
+        if (snappy_uncompressed_length(&tr_recv_buf[IF_FRAME_SIZE_LEN],
+                                       tr_recv_packet_size,
+                                       &uncompressed_size) != SNAPPY_OK) {
+          fprintf(stderr, "Warn: Invalid transfer input stream\n");
+          tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + tr_recv_packet_size;
+          continue;
+        }
+        if_write_buf_required_size = IF_FRAME_SIZE_LEN + uncompressed_size;
+
+        // brake if the interface write buffer cannot store the packet
+        if (if_write_buf_writable_size < if_write_buf_required_size)
+          break;
+
+        // decompress the packet
+        if (snappy_uncompress(
+                &tr_recv_buf[IF_FRAME_SIZE_LEN], tr_recv_packet_size,
+                &if_write_buf[IF_FRAME_SIZE_LEN + if_write_buf_pos],
+                &uncompressed_size) != SNAPPY_OK) {
+          fprintf(stderr, "Warn: Invalid transfer input stream\n");
+
+          // waste the packet
+          tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + tr_recv_packet_size;
+          continue;
+        }
+
+        // write uncompressed packet size
+        write_packet_size(&if_write_buf[if_write_buf_pos], uncompressed_size);
+
+        // move the position of interface write buffer
+        if_write_buf_pos += IF_FRAME_SIZE_LEN + uncompressed_size;
+      } else {
+
+        // write packet from transfer receive buffer to interface write buffer
+        memcpy(&if_write_buf[if_write_buf_pos], tr_recv_buf,
+               IF_FRAME_SIZE_LEN + tr_recv_packet_size);
+
+        // move the position of interface write buffer
+        if_write_buf_pos += IF_FRAME_SIZE_LEN + tr_recv_packet_size;
+      }
+
+      // move the following data of transfer receive buffer
+      memmove(tr_recv_buf,
+              &tr_recv_buf[IF_FRAME_SIZE_LEN + tr_recv_packet_size],
+              tr_recv_buf_pos - (IF_FRAME_SIZE_LEN + tr_recv_packet_size));
+
+      // move the position of transfer receive buffer
+      tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + tr_recv_packet_size;
     }
 
-    if (tr_ipos < tr_osiz) {
+    // ---------------------------------------------------
+    // Select and I/O
+    // ---------------------------------------------------
+    if (tr_recv_buf_pos < tr_send_buf_size) {
       FD_SET(tr_ifd, &rfds);
       if (nfds <= tr_ifd)
         nfds = tr_ifd + 1;
     }
-    if (tr_opos > 0) {
+
+    if (tr_send_buf_pos > 0) {
       FD_SET(tr_ofd, &wfds);
       if (nfds <= tr_ofd)
         nfds = tr_ofd + 1;
     }
-    if (if_ipos == 0) {
-      FD_SET(if_ifd, &rfds);
-      if (nfds <= if_ifd)
-        nfds = if_ifd + 1;
+
+    if (if_read_buf_pos + IF_FRAME_SIZE_LEN + max_frame_size <
+        if_read_buf_size) {
+      FD_SET(if_read_fd, &rfds);
+      if (nfds <= if_read_fd)
+        nfds = if_read_fd + 1;
     }
-    if (if_opos > 0) {
-      FD_SET(if_ofd, &wfds);
-      if (nfds <= if_ofd)
-        nfds = if_ofd + 1;
+
+    if (if_write_buf_pos >= IF_FRAME_SIZE_LEN &&
+        if_write_buf_pos >=
+            IF_FRAME_SIZE_LEN + read_packet_size(if_write_buf)) {
+      FD_SET(if_write_fd, &wfds);
+      if (nfds <= if_write_fd)
+        nfds = if_write_fd + 1;
     }
+
     if (nfds == 0) {
-      fprintf(stderr,
-              "(tr_ipos: %zu, tr_opos: %zu, if_ipos: %zu, if_opos: %zu)\n",
-              tr_ipos, tr_opos, if_ipos, if_opos);
+      fprintf(
+          stderr, "(tr_ipos: %zu, tr_opos: %zu, if_ipos: %zu, if_opos: %zu)\n",
+          tr_recv_buf_pos, tr_send_buf_pos, if_read_buf_pos, if_write_buf_pos);
       return EXIT_SUCCESS;
     }
+
     if ((nfds = select(nfds, &rfds, &wfds, NULL, NULL)) == -1) {
       perror("select");
       return EXIT_FAILURE;
     }
-    if (FD_ISSET(if_ifd, &rfds)) {
-      ssize_t rsiz;
 
-      rsiz = read(if_ifd, if_ibuf, if_isiz);
+    // ---------------------------------------------------
+    // Transfer Recv from Channel -> Transfer Recv Buffer
+    // ---------------------------------------------------
+    if (FD_ISSET(tr_ifd, &rfds)) {
+      ssize_t rsiz = read(tr_ifd, tr_recv_buf + tr_recv_buf_pos,
+                          tr_recv_buf_size - tr_recv_buf_pos);
       if (rsiz == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
@@ -610,13 +851,18 @@ int forward_packets(int argc, char *const argv[],
       if (rsiz == 0) {
         return EXIT_SUCCESS;
       }
-      if_ipos += rsiz;
+      tr_recv_buf_pos += rsiz;
       continue;
     }
-    if (FD_ISSET(if_ofd, &wfds)) {
-      ssize_t wsiz;
 
-      wsiz = write(if_ofd, if_obuf, if_opos);
+    // ---------------------------------------------------
+    // Interface Write Buffer -> Interface Write to Device
+    // ---------------------------------------------------
+    if (FD_ISSET(if_write_fd, &wfds)) {
+      size_t packet_size = read_packet_size(if_write_buf);
+
+      ssize_t wsiz =
+          write(if_write_fd, &if_write_buf[IF_FRAME_SIZE_LEN], packet_size);
       if (wsiz == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
@@ -625,17 +871,18 @@ int forward_packets(int argc, char *const argv[],
         perror("write");
         return EXIT_FAILURE;
       }
-      if_opos -= wsiz;
-      if (if_opos > 0) {
-        memmove(if_obuf, if_obuf + wsiz, if_opos);
-      }
+      if_write_buf_pos -= IF_FRAME_SIZE_LEN + wsiz;
+      memmove(if_write_buf, &if_write_buf[IF_FRAME_SIZE_LEN + wsiz],
+              if_write_buf_pos);
       continue;
     }
 
-    if (FD_ISSET(tr_ifd, &rfds)) {
-      ssize_t rsiz;
-
-      rsiz = read(tr_ifd, tr_ibuf + tr_ipos, tr_isiz - tr_ipos);
+    // ---------------------------------------------------
+    // Interface Read from Device -> Interface Read Buffer
+    // ---------------------------------------------------
+    if (FD_ISSET(if_read_fd, &rfds)) {
+      ssize_t rsiz = read(if_read_fd, if_read_buf + IF_FRAME_SIZE_LEN,
+                          if_read_buf_size - IF_FRAME_SIZE_LEN);
       if (rsiz == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
@@ -647,13 +894,18 @@ int forward_packets(int argc, char *const argv[],
       if (rsiz == 0) {
         return EXIT_SUCCESS;
       }
-      tr_ipos += rsiz;
+      write_packet_size(if_read_buf, rsiz);
+      if_read_buf_pos += IF_FRAME_SIZE_LEN + rsiz;
       continue;
     }
+
+    // ---------------------------------------------------
+    // Transfer Send Buffer -> Transfer Send to Channel
+    // ---------------------------------------------------
     if (FD_ISSET(tr_ofd, &wfds)) {
       ssize_t wsiz;
 
-      wsiz = write(tr_ofd, tr_obuf, tr_opos);
+      wsiz = write(tr_ofd, tr_send_buf, tr_send_buf_pos);
       if (wsiz == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
@@ -662,9 +914,9 @@ int forward_packets(int argc, char *const argv[],
         perror("write");
         return EXIT_FAILURE;
       }
-      tr_opos -= wsiz;
-      if (tr_opos > 0) {
-        memmove(tr_obuf, tr_obuf + wsiz, tr_opos);
+      tr_send_buf_pos -= wsiz;
+      if (tr_send_buf_pos > 0) {
+        memmove(tr_send_buf, tr_send_buf + wsiz, tr_send_buf_pos);
       }
       continue;
     }
@@ -688,6 +940,9 @@ int main(int argc, char *const argv[]) {
       {"ipv4", no_argument, NULL, '4'},
       {"ipv6", no_argument, NULL, '6'},
       {"compress", no_argument, NULL, 'c'},
+      {"max-frame-size", required_argument, NULL, 'F'},
+      {"ifbuffer-size", required_argument, NULL, 'I'},
+      {"trbuffer-size", required_argument, NULL, 'T'},
       {"version", no_argument, NULL, 'v'},
       {"help", no_argument, NULL, 'h'},
       {0, 0, 0, 0},
@@ -696,19 +951,19 @@ int main(int argc, char *const argv[]) {
   memset(&opts, 0, sizeof(opts));
 
   int optindex = 0;
-  while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46cvh", longopts,
+  while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46cI:T:F:vh", longopts,
                             &optindex)) != -1) {
     switch (opt) {
     case 'm':
-      if (opts.ifmode != 0) {
+      if (opts.ifmode != IFMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -m\n");
         print_usage(stderr, argc, argv);
         return EXIT_FAILURE;
       }
-      if (strcmp(optarg, IFMODE_TAP_OPT) == 0) {
-        opts.ifmode = IFMODE_TAP;
-      } else if (strcmp(optarg, IFMODE_TUN_OPT) == 0) {
-        opts.ifmode = IFMODE_TUN;
+      if (strcasecmp(optarg, IFMODE_L2_OPT) == 0) {
+        opts.ifmode = IFMODE_L2;
+      } else if (strcasecmp(optarg, IFMODE_L3_OPT) == 0) {
+        opts.ifmode = IFMODE_L3;
       } else {
         fprintf(stderr, "Invalid tunnel interface mode \"%s\"\n", optarg);
         print_usage(stderr, argc, argv);
@@ -748,7 +1003,7 @@ int main(int argc, char *const argv[]) {
       opts.braddifname = optarg;
       break;
     case 't':
-      if (opts.trmode != 0) {
+      if (opts.trmode != TRMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -t\n");
         print_usage(stderr, argc, argv);
         return EXIT_FAILURE;
@@ -782,7 +1037,7 @@ int main(int argc, char *const argv[]) {
       opts.port = optarg;
       break;
     case '4':
-      if (opts.ipmode != 0) {
+      if (opts.ipmode != IPMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -4 or -6\n");
         print_usage(stderr, argc, argv);
         return EXIT_FAILURE;
@@ -790,7 +1045,7 @@ int main(int argc, char *const argv[]) {
       opts.ipmode = IPMODE_IPV4;
       break;
     case '6':
-      if (opts.ipmode != 0) {
+      if (opts.ipmode != IPMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -4 or -6\n");
         print_usage(stderr, argc, argv);
         return EXIT_FAILURE;
@@ -798,12 +1053,78 @@ int main(int argc, char *const argv[]) {
       opts.ipmode = IPMODE_IPV6;
       break;
     case 'c':
-      if (opts.compflag) {
+      if (opts.compflag != COMPFLAG_UNSPEC) {
         fprintf(stderr, "Duplicated option -c\n");
         print_usage(stderr, argc, argv);
         return EXIT_FAILURE;
       }
-      opts.compflag = 1;
+      opts.compflag = COMPFLAG_COMPRESS;
+      break;
+    case 'F':
+      if (opts.max_frame_size != 0) {
+        fprintf(stderr, "Duplicated option -F\n");
+        print_usage(stderr, argc, argv);
+        return EXIT_FAILURE;
+      }
+      {
+        char *p;
+        opts.max_frame_size = strtoul(optarg, &p, 0);
+        if (p == optarg || *p != '\0') {
+          fprintf(stderr, "Invalid option value -F\n");
+          print_usage(stderr, argc, argv);
+          return EXIT_FAILURE;
+        }
+        if (opts.max_frame_size < IF_MAX_FRAME_SIZE_MIN ||
+            opts.max_frame_size > IF_MAX_FRAME_SIZE_MAX) {
+          fprintf(stderr, "Invalid option value -F\n");
+          print_usage(stderr, argc, argv);
+          return EXIT_FAILURE;
+        }
+      }
+      break;
+    case 'I':
+      if (opts.ifbuffer_size != 0) {
+        fprintf(stderr, "Duplicated option -I\n");
+        print_usage(stderr, argc, argv);
+        return EXIT_FAILURE;
+      }
+      {
+        char *p;
+        opts.ifbuffer_size = strtoul(optarg, &p, 0);
+        if (p == optarg || *p != '\0') {
+          fprintf(stderr, "Invalid option value -I\n");
+          print_usage(stderr, argc, argv);
+          return EXIT_FAILURE;
+        }
+        if (opts.ifbuffer_size < IF_BUFFER_SIZE_MIN ||
+            opts.ifbuffer_size > IF_BUFFER_SIZE_MAX) {
+          fprintf(stderr, "Invalid option value -I\n");
+          print_usage(stderr, argc, argv);
+          return EXIT_FAILURE;
+        }
+      }
+      break;
+    case 'T':
+      if (opts.trbuffer_size != 0) {
+        fprintf(stderr, "Duplicated option -T\n");
+        print_usage(stderr, argc, argv);
+        return EXIT_FAILURE;
+      }
+      {
+        char *p;
+        opts.trbuffer_size = strtoul(optarg, &p, 0);
+        if (p == optarg || *p != '\0') {
+          fprintf(stderr, "Invalid option value -T\n");
+          print_usage(stderr, argc, argv);
+          return EXIT_FAILURE;
+        }
+        if (opts.trbuffer_size < TR_BUFFER_SIZE_MIN ||
+            opts.trbuffer_size > TR_BUFFER_SIZE_MAX) {
+          fprintf(stderr, "Invalid option value -T\n");
+          print_usage(stderr, argc, argv);
+          return EXIT_FAILURE;
+        }
+      }
       break;
     case 'v':
       fprintf(stdout, "%s : Create tunnel interface\n", PACKAGE_STRING);
@@ -819,21 +1140,23 @@ int main(int argc, char *const argv[]) {
     }
   }
 
-  if (opts.ifmode == 0) {
+  if (opts.ifmode == IFMODE_UNSPEC) {
     opts.ifmode = IFMODE_DEFAULT;
   }
 
-  if (opts.brname != NULL && opts.ifmode == IFMODE_TUN) {
-    fprintf(stderr, "-b is not supported for tun mode\n");
+  if (opts.brname != NULL && opts.ifmode == IFMODE_L3) {
+    fprintf(stderr, "-b is not supported for L3 mode\n");
     print_usage(stderr, argc, argv);
     return EXIT_FAILURE;
   }
 
-  if (opts.trmode == 0) {
-    opts.trmode = TRMODE_DEFAULT;
-  }
+  switch (opts.trmode) {
 
-  if (opts.trmode == TRMODE_STDIO) {
+  case TRMODE_UNSPEC:
+    opts.trmode = TRMODE_DEFAULT;
+    break;
+
+  case TRMODE_STDIO:
     if (opts.node != NULL) {
       fprintf(stderr, "-l is not supported for stdio mode\n");
       print_usage(stderr, argc, argv);
@@ -847,14 +1170,18 @@ int main(int argc, char *const argv[]) {
     if (opts.ipmode != 0) {
       fprintf(stderr, "-4 or -6 is not supported for stdio mode\n");
     }
-  }
+    break;
 
-  if (opts.trmode == TRMODE_CLIENT) {
+  case TRMODE_SERVER:
+    break;
+
+  case TRMODE_CLIENT:
     if (opts.node == NULL) {
       fprintf(stderr, "-l is required for client mode\n");
       print_usage(stderr, argc, argv);
       return EXIT_FAILURE;
     }
+    break;
   }
 
   if (opts.port == NULL) {
@@ -872,7 +1199,8 @@ int main(int argc, char *const argv[]) {
     if (tunfd == -1) {
       return EXIT_FAILURE;
     }
-    return forward_packets(argc, argv, &opts, tunfd, 0, 1);
+    return forward_packets(argc, argv, &opts, tunfd, STDIN_FILENO,
+                           STDOUT_FILENO);
   }
 
   {
@@ -880,11 +1208,17 @@ int main(int argc, char *const argv[]) {
     int s;
 
     memset(&aih, 0, sizeof(aih));
-    aih.ai_family = AF_UNSPEC;
-    if (opts.ipmode == IPMODE_IPV4)
+    switch (opts.ipmode) {
+    case IPMODE_UNSPEC:
+      aih.ai_family = AF_UNSPEC;
+      break;
+    case IPMODE_IPV4:
       aih.ai_family = AF_INET;
-    if (opts.ipmode == IPMODE_IPV6)
+      break;
+    case IPMODE_IPV6:
       aih.ai_family = AF_INET6;
+      break;
+    }
     if (opts.trmode == TRMODE_SERVER)
       aih.ai_flags = AI_PASSIVE;
     aih.ai_socktype = SOCK_STREAM;
