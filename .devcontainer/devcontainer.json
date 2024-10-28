@@ -4,7 +4,9 @@
     "runArgs": [
         "--privileged",
         "--init",
-        "--user=user"
+        "--user=user",
+        "--group-add=docker",
+        "-v", "/var/run/docker.sock:/var/run/docker.sock"
     ],
     "customizations": {
         "vscode": {
@@ -17,6 +19,5 @@
     },
     "features": {
         "ghcr.io/devcontainers/features/docker-in-docker:2": {}
-    },
-    "postCreateCommand": "sudo gpasswd -a user docker"
+    }
 }
