@@ -4,7 +4,6 @@
     "runArgs": [
         "--privileged",
         "--init",
-        "--user=user",
         "--group-add=docker"
     ],
     "customizations": {
