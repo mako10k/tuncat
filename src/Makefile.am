@@ -6,5 +6,11 @@ CFLAGS = -Wall -Wextra -Werror
 
 install-exec-hook:
 	@if [ `id -u` -eq 0 ]; then \
-	    setcap cap_net_admin=ep $(DESTDIR)$(bindir)/tuncat ; \
+		if [ -x /sbin/setcap ]; then \
+			setcap cap_net_admin=ep "$(DESTDIR)$(bindir)/tuncat" ; \
+		else \
+			echo "setcap not found, falling back to setuid root" ; \
+			chown root:root "$(DESTDIR)$(bindir)/tuncat" ; \
+			chmod u+s "$(DESTDIR)$(bindir)/tuncat" ; \
+		fi ; \
 	fi

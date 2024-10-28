@@ -167,6 +167,28 @@ int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
     perror("open");
     return -1;
   }
+  if (getuid() != geteuid()) {
+    if (ioctl(fd, TUNSETOWNER, getuid()) < 0) {
+      perror("Error while setting tunnel owner");
+      return -1;
+    }
+  }
+  if (getgid() != getegid()) {
+    if (ioctl(fd, TUNSETGROUP, getgid()) < 0) {
+      perror("Error while setting tunnel group");
+      return -1;
+    }
+    if (setgid(getgid()) < 0) {
+      perror("Error while setting group id");
+      return -1;
+    }
+  }
+  if (getuid() != geteuid()) {
+    if (setuid(getuid()) < 0) {
+      perror("Error while setting user id");
+      return -1;
+    }
+  }
 
   memset(&ifr, 0, sizeof(ifr));
   ifr.ifr_flags = 0;
