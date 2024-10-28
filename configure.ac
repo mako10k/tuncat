@@ -6,7 +6,7 @@ AC_INIT([tuncat],[0.9.3],[mako10k@mk10.org])
 AM_INIT_AUTOMAKE([foreign])
 AC_CONFIG_SRCDIR([src/tuncat.c])
 AC_CONFIG_HEADERS([config.h])
-
+AC_USE_SYSTEM_EXTENSIONS
 
 # Checks for programs.
 AC_PROG_CC

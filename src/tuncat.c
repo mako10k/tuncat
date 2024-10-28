@@ -1,3 +1,7 @@
+#include "tuncat.h"
+#include "tuncat_if.h"
+#include "tuncat_net.h"
+
 #include <alloca.h>
 #include <arpa/inet.h>
 #include <assert.h>
@@ -26,55 +30,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "tuncat.h"
-
-static int inet6_net_pton(int af, const char *cp, void *buf, size_t len) {
-  if (af != AF_INET6) {
-    errno = EAFNOSUPPORT;
-    return -1;
-  }
-
-  char _buf[INET6_ADDRSTRLEN + sizeof("/128")];
-  strncpy(_buf, cp, sizeof(_buf) - 1);
-  char *sep = strchr(_buf, '/');
-  if (sep != NULL) {
-    *sep++ = '\0';
-  }
-  struct in6_addr addr6;
-  if (inet_pton(af, _buf, &addr6) != 1) {
-    errno = ENOENT;
-    return -1;
-  }
-
-  long bits = 128;
-  if (sep == NULL) {
-    goto end;
-  }
-
-  char *p;
-  bits = strtol(sep, &p, 10);
-  if (*p != '\0' || bits < 0 || bits > 128) {
-    errno = EINVAL;
-    return -1;
-  }
-end:
-  memcpy(buf, &addr6, len < sizeof(addr6) ? len : sizeof(addr6));
-  return bits;
-}
-
-static int inet_net_pton_orig(int af, const char *cp, void *buf, size_t len) {
-  if (af == AF_INET)
-    return inet_net_pton(af, cp, buf, len);
-  if (af == AF_INET6)
-    return inet6_net_pton(af, cp, buf, len);
-  errno = EAFNOSUPPORT;
-  return -1;
-}
-
-#define inet_net_pton inet_net_pton_orig
-
-void print_usage(FILE *fp, int argc, char *const argv[]) {
+/**
+ * **print_usage** : print usage
+ *
+ * @param fp    file pointer
+ * @param argc  argument count
+ * @param argv  argument vector
+ */
+static void print_usage(FILE *fp, int argc, char *const argv[]) {
   (void)argc;
+
+#define ISDEFS(DEF, VAR) (VAR), (strcmp((DEF), (VAR)) == 0 ? "  (default)" : "")
+
   fprintf(fp, "\n");
   fprintf(fp, "Usage:\n");
   fprintf(fp, "  %s [options]\n", argv[0]);
@@ -84,10 +51,10 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp,
           "  -a,--ifaddress=<addr>       Interface address (only with -n)\n");
   fprintf(fp, "\n");
-  fprintf(fp, "  -m,--tunnel-mode=%-6s     L3 payload mode%s\n", IFMODE_L3_OPT,
-          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L3_OPT) == 0 ? "  (default)" : "");
-  fprintf(fp, "  -m,--tunnel-mode=%-6s     L2 payload mode%s\n", IFMODE_L2_OPT,
-          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L2_OPT) == 0 ? " (default)" : "");
+  fprintf(fp, "  -m,--tunnel-mode=%-6s     L3 payload mode%s\n",
+          ISDEFS(IFMODE_DEFAULT_OPT, IFMODE_L3_OPT));
+  fprintf(fp, "  -m,--tunnel-mode=%-6s     L2 payload mode%s\n",
+          ISDEFS(IFMODE_DEFAULT_OPT, IFMODE_L2_OPT));
   fprintf(fp, "\n");
   fprintf(fp, "  -b,--bridge-name=<name>     Bridge interface (L2 payload)\n");
   fprintf(fp, "  -i,--bridge-members=<ifname>[,<if_name>...]\n");
@@ -97,15 +64,12 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp, "  -a,--ifaddress=<addr>       Bridge interface address (only "
               "with -b)\n");
   fprintf(fp, "\n");
-  fprintf(fp, "  -t,--transfer-mode=%-6s   Stdio mode%s\n", TRMODE_STDIO_OPT,
-          strcmp(TRMODE_DEFAULT_OPT, TRMODE_STDIO_OPT) == 0 ? "       (default)"
-                                                            : "");
-  fprintf(
-      fp, "  -t,--transfer-mode=%-6s   TCP server mode%s\n", TRMODE_SERVER_OPT,
-      strcmp(TRMODE_DEFAULT_OPT, TRMODE_SERVER_OPT) == 0 ? "  (default)" : "");
-  fprintf(
-      fp, "  -t,--transfer-mode=%-6s   TCP client mode%s\n", TRMODE_CLIENT_OPT,
-      strcmp(TRMODE_DEFAULT_OPT, TRMODE_CLIENT_OPT) == 0 ? "  (default)" : "");
+  fprintf(fp, "  -t,--transfer-mode=%-6s   Stdio mode%s\n",
+          ISDEFS(TRMODE_DEFAULT_OPT, TRMODE_STDIO_OPT));
+  fprintf(fp, "  -t,--transfer-mode=%-6s   TCP server mode%s\n",
+          ISDEFS(TRMODE_DEFAULT_OPT, TRMODE_SERVER_OPT));
+  fprintf(fp, "  -t,--transfer-mode=%-6s   TCP client mode%s\n",
+          ISDEFS(TRMODE_DEFAULT_OPT, TRMODE_CLIENT_OPT));
   fprintf(fp, "  -l,--address=<addr>         Listen Address   (default: any) "
               "  (TCP server)\n");
   fprintf(fp,
@@ -135,167 +99,6 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp, "  -v,--version                Print version\n");
   fprintf(fp, "  -h,--help                   Print this usage\n");
   fprintf(fp, "\n");
-}
-
-int change_ifflags(int sock, const char *ifname, int flags_clear,
-                   int flags_set) {
-  struct ifreq ifr;
-
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-  if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-    perror("Cannot get interface flags");
-    return -1;
-  }
-  typeof(ifr.ifr_flags) flags_new = (ifr.ifr_flags & ~flags_clear) | flags_set;
-  if (flags_new != ifr.ifr_flags) {
-    ifr.ifr_flags = flags_new;
-    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-      perror("Cannot set interface flags");
-      return -1;
-    }
-  }
-
-  return 0;
-}
-
-int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
-  int fd;
-  struct ifreq ifr;
-
-  if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
-    perror("open");
-    return -1;
-  }
-  if (getuid() != geteuid()) {
-    if (ioctl(fd, TUNSETOWNER, getuid()) < 0) {
-      perror("Error while setting tunnel owner");
-      return -1;
-    }
-  }
-  if (getgid() != getegid()) {
-    if (ioctl(fd, TUNSETGROUP, getgid()) < 0) {
-      perror("Error while setting tunnel group");
-      return -1;
-    }
-    if (setgid(getgid()) < 0) {
-      perror("Error while setting group id");
-      return -1;
-    }
-  }
-  if (getuid() != geteuid()) {
-    if (setuid(getuid()) < 0) {
-      perror("Error while setting user id");
-      return -1;
-    }
-  }
-
-  memset(&ifr, 0, sizeof(ifr));
-  ifr.ifr_flags = 0;
-  switch (ifmode) {
-  case IFMODE_L2:
-    ifr.ifr_flags |= IFF_TAP;
-    break;
-  case IFMODE_UNSPEC:
-  case IFMODE_L3:
-    ifr.ifr_flags |= IFF_TUN;
-    break;
-  }
-
-#ifdef IFF_NO_PI
-  ifr.ifr_flags |= IFF_NO_PI;
-#endif
-
-  if (ifname) {
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-  }
-  if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
-    perror("Error while creating tunnel interface");
-    return -1;
-  }
-
-  if (change_ifflags(sock, ifr.ifr_name, 0, IFF_UP | IFF_RUNNING) < 0) {
-    return -1;
-  }
-
-  return fd;
-}
-
-int get_ifindex(int sock, const char *ifname) {
-  struct ifreq ifr;
-
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-  if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
-    return 0;
-  }
-
-  return ifr.ifr_ifindex;
-}
-
-int create_bridge(int sock, char *brname) {
-  struct ifreq ifr;
-
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, brname, IFNAMSIZ);
-  if (ioctl(sock, SIOCBRADDBR, &ifr) < 0) {
-    perror("Cannot create bridge device");
-    return -1;
-  }
-
-  return 0;
-}
-
-int delete_bridge(int sock, char *brname) {
-  struct ifreq ifr;
-
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, brname, IFNAMSIZ);
-  if (ioctl(sock, SIOCBRDELBR, &ifr) < 0) {
-    perror("Cannot delete bridge device");
-    return -1;
-  }
-
-  return 0;
-}
-
-int add_bridge_member(int sock, const char *brname, const char *ifname) {
-  struct ifreq ifr;
-
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, brname, IFNAMSIZ);
-  ifr.ifr_ifindex = get_ifindex(sock, ifname);
-  if (ifr.ifr_ifindex == 0) {
-    fprintf(stderr, "Cannot get interface index\n");
-    return -1;
-  }
-  if (ioctl(sock, SIOCBRADDIF, &ifr) < 0) {
-    perror("Cannot append interface to bridge device");
-    return -1;
-  }
-
-  return 0;
-}
-
-char *brname = NULL;
-
-void cleanbr() {
-  if (brname) {
-    int sock;
-
-    if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-      perror("socket");
-      return;
-    }
-    change_ifflags(sock, brname, IFF_UP, 0);
-    delete_bridge(sock, brname);
-    close(sock);
-  }
-}
-
-void cleanbr_sig(int sig) {
-  (void)sig;
-  cleanbr();
 }
 
 static int cmp_addr(int family, const void *addr1, const void *addr2) {
@@ -330,7 +133,7 @@ static int convert_bcastaddr(const void *addr, int bits, void *broadcastaddr) {
   return 0;
 }
 
-int convert_bits_to_netmask(int family, int bits, void *mask) {
+static int convert_bits_to_netmask(int family, int bits, void *mask) {
   if (family == AF_INET) {
     if (bits < 0 || bits > 32) {
       return -1;
@@ -361,7 +164,7 @@ int convert_bits_to_netmask(int family, int bits, void *mask) {
   return 0;
 }
 
-int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
+static int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
   struct in6_ifreq ifr6;
   struct in6_addr addr6;
 
@@ -390,7 +193,7 @@ int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
   return 0;
 }
 
-int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
+static int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
   struct ifreq ifr;
   struct sockaddr_in addr, mask, nwork, bcast;
 
@@ -498,7 +301,7 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
   return 0;
 }
 
-int init_if(struct tuncat_commandline_options *optsp) {
+static int init_if(struct tuncat_commandline_options *optsp) {
   int sock = socket(PF_INET, SOCK_DGRAM, 0);
   if (sock == -1) {
     perror("socket");
@@ -527,11 +330,10 @@ int init_if(struct tuncat_commandline_options *optsp) {
       if (brindex == -1) {
         return EXIT_FAILURE;
       }
-      brname = optsp->brname;
-      atexit(cleanbr);
+      on_exit(cleanbr, optsp->brname);
       struct sigaction sa;
       memset(&sa, 0, sizeof(sa));
-      sa.sa_handler = cleanbr;
+      sa.sa_handler = cleanbr_sig;
       sigaction(SIGINT, &sa, NULL);
       sigaction(SIGTERM, &sa, NULL);
     }
@@ -560,7 +362,7 @@ int init_if(struct tuncat_commandline_options *optsp) {
         if ((ifn = strchr(ifname, ','))) {
           *ifn = '\0';
         }
-        if (add_bridge_member(sock, brname, ifname) < 0) {
+        if (add_bridge_member(sock, remove_brname(), ifname) < 0) {
           return EXIT_FAILURE;
         }
         if (!ifn) {
@@ -585,9 +387,9 @@ static void write_packet_size(char *buf, size_t size) {
   *(uint16_t *)buf = htons(size);
 }
 
-int forward_packets(int argc, char *const argv[],
-                    struct tuncat_commandline_options *optsp, int tunfd,
-                    int tr_ifd, int tr_ofd) {
+static int forward_packets(int argc, char *const argv[],
+                           struct tuncat_commandline_options *optsp, int tunfd,
+                           int tr_ifd, int tr_ofd) {
   (void)argc;
   (void)argv;
 

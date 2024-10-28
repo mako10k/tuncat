@@ -77,6 +77,4 @@ struct tuncat_commandline_options {
   size_t trbuffer_size;
 };
 
-void print_usage(FILE *, int, char *const[]);
-
 #endif

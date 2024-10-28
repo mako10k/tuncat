@@ -11,7 +11,8 @@
             "extensions": [
                 "ms-azuretools.vscode-docker",
                 "llvm-vs-code-extensions.vscode-clangd",
-                "ms-vscode-remote.remote-containers"
+                "ms-vscode-remote.remote-containers",
+                "ms-vscode.makefile-tools"
             ]
         }
     },

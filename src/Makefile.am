@@ -1,7 +1,12 @@
 bin_PROGRAMS = tuncat
-tuncat_SOURCES = tuncat.c tuncat.h
+tuncat_SOURCES = \
+  tuncat.c tuncat.h \
+  tuncat_if.c tuncat_if.h \
+  tuncat_net.c tuncat_net.h
+
 tuncat_CFLAGS = @SNAPPY_CFLAGS@
 tuncat_LDADD = @SNAPPY_LIBS@
+
 CFLAGS = -Wall -Wextra -Werror
 
 install-exec-hook:
