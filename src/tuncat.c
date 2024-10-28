@@ -317,7 +317,7 @@ static int init_if(struct tuncat_commandline_options *optsp) {
         sprintf(ifname, "tap%d", i++);
       else
         sprintf(ifname, "tun%d", i++);
-      if (get_ifindex(sock, tunname) == 0) {
+      if (get_ifindex(sock, ifname) == 0) {
         if (i < 999)
           break;
         fprintf(stderr, "Cannot get interface index\n");
