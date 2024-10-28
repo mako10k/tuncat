@@ -308,15 +308,32 @@ static int init_if(struct tuncat_commandline_options *optsp) {
     return EXIT_FAILURE;
   }
 
-  int tunfd = create_tunif(sock, optsp->ifname, optsp->ifmode);
+  const char *tunname = optsp->ifname;
+  char ifname[] = "tun999";
+
+  if (tunname == NULL) {
+    for (unsigned int i = 0; i < 1000; i++) {
+      if (optsp->ifmode == IFMODE_L2)
+        sprintf(ifname, "tap%d", i++);
+      else
+        sprintf(ifname, "tun%d", i++);
+      if (get_ifindex(sock, tunname) == 0) {
+        if (i < 999)
+          break;
+        fprintf(stderr, "Cannot get interface index\n");
+      }
+    }
+    tunname = ifname;
+  }
+
+  int tunfd = create_tunif(sock, tunname, optsp->ifmode);
   if (tunfd == -1) {
     return EXIT_FAILURE;
   }
-  const char *tunname = optsp->ifname;
 
   if (optsp->brname == NULL) {
     if (optsp->addr != NULL) {
-      if (set_ifaddr(sock, optsp->ifname, optsp->addr) < 0) {
+      if (set_ifaddr(sock, tunname, optsp->addr) < 0) {
         return EXIT_FAILURE;
       }
     }
