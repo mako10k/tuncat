@@ -16,5 +16,7 @@
         }
     },
     "features": {
-    }
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+    },
+    "postCreateCommand": "sudo gpasswd -a user docker"
 }
