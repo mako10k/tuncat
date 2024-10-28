@@ -25,7 +25,3 @@ RUN  apt-get update \
   && useradd -m -s /bin/bash -G sudo user \
   && echo "user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/user \
   && chmod 0440 /etc/sudoers.d/user
-
-COPY entrypoint.sh /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
