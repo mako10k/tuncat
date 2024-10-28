@@ -6,7 +6,8 @@
         "--init",
         "--user=user",
         "--group-add=docker",
-        "-v", "/var/run/docker.sock:/var/run/docker.sock"
+        "-v",
+        "/var/run/docker.sock:/var/run/docker.sock"
     ],
     "customizations": {
         "vscode": {
@@ -19,5 +20,6 @@
     },
     "features": {
         "ghcr.io/devcontainers/features/docker-in-docker:2": {}
-    }
+    },
+    "postStartCommand": "sudo chown root:docker /var/run/docker.sock; sudo chmod 660 /var/run/docker.sock"
 }
