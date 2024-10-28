@@ -23,7 +23,12 @@ RUN env \
             libsnappy-dev \
             libtool \
             ssh \
+            sudo \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
           2>&1
+
+RUN useradd -m -s /bin/bash -G sudo user; \
+    echo "user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/user; \
+    chmod 0440 /etc/sudoers.d/user
 
