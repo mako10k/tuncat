@@ -2,13 +2,12 @@
 #include "tuncat_if.h"
 #include "tuncat_net.h"
 
-#include <alloca.h>
+#include <net/if.h>
+
 #include <arpa/inet.h>
 #include <assert.h>
-#include <fcntl.h>
-#include <net/if.h> // must be before <linux/if.h>
-
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
@@ -17,16 +16,13 @@
 #include <linux/sockios.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
-#include <snappy-c.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -88,13 +84,6 @@ static void print_usage(FILE *fp, int argc, char *const argv[]) {
               "TCP client)\n");
   fprintf(fp, "\n");
   fprintf(fp, "  -c,--compress               Compress mode\n");
-  fprintf(fp, "\n");
-  fprintf(fp, "  -F,--max-frame-size=<size>  Max frame size (default: %zu)\n",
-          (size_t)IF_MAX_FRAME_SIZE_DEF);
-  fprintf(fp, "  -I,--ifbuffer-size=<size>   Interface buffer size\n");
-  fprintf(fp, "                   (default: <Max frame size> * 2)\n");
-  fprintf(fp, "  -T,--trbuffer-size=<size>   Transfer buffer size\n");
-  fprintf(fp, "                   (default: <Interface Buffersize>)\n");
   fprintf(fp, "\n");
   fprintf(fp, "  -v,--version                Print version\n");
   fprintf(fp, "  -h,--help                   Print this usage\n");
@@ -395,373 +384,149 @@ static int init_if(struct tuncat_commandline_options *optsp) {
   return tunfd;
 }
 
-static size_t read_packet_size(const char *buf) {
-  return ntohs(*(uint16_t *)buf);
-}
+#define FRAME_LEN_MAX 65536
+#define FRAME_LEN_SIZE 2
 
-static void write_packet_size(char *buf, size_t size) {
-  assert(size <= 65535);
-  *(uint16_t *)buf = htons(size);
-}
+static int tuncat_if_to_tr(int ifrfd, int trsfd) {
+  assert(ifrfd >= 0);
+  assert(trsfd >= 0);
+  char buf[FRAME_LEN_MAX + FRAME_LEN_SIZE];
 
-static int forward_packets(int argc, char *const argv[],
-                           struct tuncat_commandline_options *optsp, int tunfd,
-                           int tr_ifd, int tr_ofd) {
-  (void)argc;
-  (void)argv;
-
-  enum compflag compflag = optsp->compflag;
-
-  size_t max_frame_size = optsp->max_frame_size ?: IF_MAX_FRAME_SIZE_DEF;
-
-  const size_t if_read_buf_size = optsp->ifbuffer_size ?: 2 * max_frame_size;
-  const size_t if_write_buf_size = optsp->ifbuffer_size ?: 2 * max_frame_size;
-  const size_t tr_recv_buf_size = optsp->trbuffer_size ?: if_write_buf_size;
-  const size_t tr_send_buf_size = optsp->trbuffer_size ?: if_read_buf_size;
-
-  char if_read_buf[if_read_buf_size];
-  char if_write_buf[if_write_buf_size];
-  char tr_recv_buf[tr_recv_buf_size];
-  char tr_send_buf[tr_send_buf_size];
-
-  const int if_read_fd = tunfd;
-  const int if_write_fd = tunfd;
-
-  size_t if_read_buf_pos = 0;
-  size_t if_write_buf_pos = 0;
-  size_t tr_recv_buf_pos = 0;
-  size_t tr_send_buf_pos = 0;
-
-  if (fcntl(tunfd, F_SETFL, O_NONBLOCK) == -1) {
-    perror("fcntl");
-    return EXIT_FAILURE;
-  }
-  if (fcntl(tr_ifd, F_SETFL, O_NONBLOCK) == -1) {
-    perror("fcntl");
-    return EXIT_FAILURE;
-  }
-  if (tr_ifd != tr_ofd && fcntl(tr_ofd, F_SETFL, O_NONBLOCK) == -1) {
-    perror("fcntl");
-    return EXIT_FAILURE;
-  }
-
-  // Transfer Information
-  write_packet_size(&tr_send_buf[tr_send_buf_pos], 0);
-  tr_send_buf_pos += IF_FRAME_SIZE_LEN;
-  tr_send_buf[tr_send_buf_pos++] = optsp->ifmode;
-  tr_send_buf[tr_send_buf_pos++] = optsp->compflag;
-  write_packet_size(&tr_send_buf[tr_send_buf_pos], optsp->max_frame_size);
-  tr_send_buf_pos += IF_FRAME_SIZE_LEN;
-
-  for (;;) {
-    int nfds;
-    fd_set rfds, wfds;
-    nfds = 0;
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-
-    // ---------------------------------------------------
-    // Interface Read Buffer -> Transfer Send Buffer
-    // ---------------------------------------------------
-    while (1) {
-
-      // brake if the packet size cannot read from interface read buffer
-      if (if_read_buf_pos < IF_FRAME_SIZE_LEN)
-        break;
-
-      // read packet size from interface read buffer
-      const size_t if_read_packet_size = read_packet_size(if_read_buf);
-
-      // brake if the packet content cannot read from interface read buffer
-      if (if_read_buf_pos < IF_FRAME_SIZE_LEN + if_read_packet_size)
-        break;
-
-      // calculate writing capacity of transfer send buffer
-      const size_t tr_send_buf_writable_size =
-          tr_send_buf_size - tr_send_buf_pos;
-
-      // calculate required size of transfer send buffer
-      size_t tr_send_buf_required_size =
-          IF_FRAME_SIZE_LEN + if_read_packet_size;
-      if (compflag == COMPFLAG_COMPRESS) {
-        // calculate MAX required size of transfer send buffer with compression
-        tr_send_buf_required_size =
-            IF_FRAME_SIZE_LEN +
-            snappy_max_compressed_length(if_read_packet_size);
-      }
-
-      // brake if the transfer send buffer cannot store the packet
-      if (tr_send_buf_writable_size < tr_send_buf_required_size)
-        break;
-
-      if (compflag == COMPFLAG_COMPRESS) {
-        // read from interface read buffer, compress and write packet
-
-        size_t compressed_size =
-            tr_send_buf_size - (IF_FRAME_SIZE_LEN + tr_send_buf_pos);
-
-        // compressing the packet
-        if (snappy_compress(&if_read_buf[IF_FRAME_SIZE_LEN],
-                            if_read_packet_size,
-                            &tr_send_buf[IF_FRAME_SIZE_LEN + tr_send_buf_pos],
-                            &compressed_size) != SNAPPY_OK) {
-          fprintf(stderr, "Fatal: snappy_compress failed\n");
-          return EXIT_FAILURE;
-        }
-
-        // write compressed packet size
-        write_packet_size(&tr_send_buf[tr_send_buf_pos], compressed_size);
-
-        // move the position of transfer send buffer
-        tr_send_buf_pos += IF_FRAME_SIZE_LEN + compressed_size;
-
-      } else if (tr_send_buf_writable_size >= tr_send_buf_required_size) {
-
-        // copy packet from interface read buffer to transfer send buffer
-        memcpy(&tr_send_buf[tr_send_buf_pos], if_read_buf,
-               IF_FRAME_SIZE_LEN + if_read_packet_size);
-
-        // move the position of transfer send buffer
-        tr_send_buf_pos += IF_FRAME_SIZE_LEN + if_read_packet_size;
-      }
-
-      // move the following data of interface read buffer
-      memmove(if_read_buf,
-              &if_read_buf[IF_FRAME_SIZE_LEN + if_read_packet_size],
-              if_read_buf_pos - (IF_FRAME_SIZE_LEN + if_read_packet_size));
-      // ^ TODO: should be minimize buffer move
-
-      // move the position of interface read buffer
-      if_read_buf_pos -= IF_FRAME_SIZE_LEN + if_read_packet_size;
-    }
-
-    // ---------------------------------------------------
-    // Transfer Recv Buffer -> Interface Write Buffer
-    // ---------------------------------------------------
-    while (1) {
-
-      // brake if the packet size cannot read from transfer receive buffer
-      if (tr_recv_buf_pos < IF_FRAME_SIZE_LEN)
-        break;
-
-      // read packet size from transfer receive buffer
-      const size_t tr_recv_packet_size = read_packet_size(tr_recv_buf);
-
-      // operate information packet
-      if (tr_recv_packet_size == 0) {
-        // 4 byte of transfer information
-        if (tr_recv_buf_pos < IF_FRAME_SIZE_LEN + 4)
-          break;
-        const enum ifmode received_ifmode = tr_recv_buf[IF_FRAME_SIZE_LEN];
-        const enum compflag received_compflag =
-            tr_recv_buf[IF_FRAME_SIZE_LEN + 1];
-        const size_t received_max_frame_size =
-            read_packet_size(&tr_recv_buf[IF_FRAME_SIZE_LEN + 2]);
-        memmove(tr_recv_buf, &tr_recv_buf[IF_FRAME_SIZE_LEN + 4],
-                tr_recv_buf_pos - (IF_FRAME_SIZE_LEN + 4));
-        tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + 4;
-
-        // TODO: check received information
-        (void)received_ifmode;
-        (void)received_compflag;
-        (void)received_max_frame_size;
-
+  while (1) {
+    ssize_t frsz = read(ifrfd, buf + FRAME_LEN_SIZE, FRAME_LEN_MAX);
+    if (frsz == -1) {
+      if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+          errno == EINPROGRESS) {
         continue;
       }
-
-      // brake if the packet content cannot read from transfer receive buffer
-      if (tr_recv_buf_pos < IF_FRAME_SIZE_LEN + tr_recv_packet_size)
-        break;
-
-      // calculate writing capacity of interface write buffer
-      const size_t if_write_buf_writable_size =
-          if_write_buf_size - if_write_buf_pos;
-
-      // calculate required size of interface write buffer
-      size_t if_write_buf_required_size =
-          IF_FRAME_SIZE_LEN + tr_recv_packet_size;
-
-      if (compflag == COMPFLAG_COMPRESS) {
-        // calculate required size of interface write buffer with compression
-        size_t uncompressed_size;
-        if (snappy_uncompressed_length(&tr_recv_buf[IF_FRAME_SIZE_LEN],
-                                       tr_recv_packet_size,
-                                       &uncompressed_size) != SNAPPY_OK) {
-          fprintf(stderr, "Warn: Invalid transfer input stream\n");
-          tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + tr_recv_packet_size;
-          continue;
-        }
-        if_write_buf_required_size = IF_FRAME_SIZE_LEN + uncompressed_size;
-
-        // brake if the interface write buffer cannot store the packet
-        if (if_write_buf_writable_size < if_write_buf_required_size)
-          break;
-
-        // decompress the packet
-        if (snappy_uncompress(
-                &tr_recv_buf[IF_FRAME_SIZE_LEN], tr_recv_packet_size,
-                &if_write_buf[IF_FRAME_SIZE_LEN + if_write_buf_pos],
-                &uncompressed_size) != SNAPPY_OK) {
-          fprintf(stderr, "Warn: Invalid transfer input stream\n");
-
-          // waste the packet
-          tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + tr_recv_packet_size;
-          continue;
-        }
-
-        // write uncompressed packet size
-        write_packet_size(&if_write_buf[if_write_buf_pos], uncompressed_size);
-
-        // move the position of interface write buffer
-        if_write_buf_pos += IF_FRAME_SIZE_LEN + uncompressed_size;
-      } else {
-
-        // write packet from transfer receive buffer to interface write buffer
-        memcpy(&if_write_buf[if_write_buf_pos], tr_recv_buf,
-               IF_FRAME_SIZE_LEN + tr_recv_packet_size);
-
-        // move the position of interface write buffer
-        if_write_buf_pos += IF_FRAME_SIZE_LEN + tr_recv_packet_size;
-      }
-
-      // move the following data of transfer receive buffer
-      memmove(tr_recv_buf,
-              &tr_recv_buf[IF_FRAME_SIZE_LEN + tr_recv_packet_size],
-              tr_recv_buf_pos - (IF_FRAME_SIZE_LEN + tr_recv_packet_size));
-
-      // move the position of transfer receive buffer
-      tr_recv_buf_pos -= IF_FRAME_SIZE_LEN + tr_recv_packet_size;
+      perror("read from interface");
+      return -1;
     }
-
-    // ---------------------------------------------------
-    // Select and I/O
-    // ---------------------------------------------------
-    if (tr_recv_buf_pos < tr_send_buf_size) {
-      FD_SET(tr_ifd, &rfds);
-      if (nfds <= tr_ifd)
-        nfds = tr_ifd + 1;
-    }
-
-    if (tr_send_buf_pos > 0) {
-      FD_SET(tr_ofd, &wfds);
-      if (nfds <= tr_ofd)
-        nfds = tr_ofd + 1;
-    }
-
-    if (if_read_buf_pos + IF_FRAME_SIZE_LEN + max_frame_size <
-        if_read_buf_size) {
-      FD_SET(if_read_fd, &rfds);
-      if (nfds <= if_read_fd)
-        nfds = if_read_fd + 1;
-    }
-
-    if (if_write_buf_pos >= IF_FRAME_SIZE_LEN &&
-        if_write_buf_pos >=
-            IF_FRAME_SIZE_LEN + read_packet_size(if_write_buf)) {
-      FD_SET(if_write_fd, &wfds);
-      if (nfds <= if_write_fd)
-        nfds = if_write_fd + 1;
-    }
-
-    if (nfds == 0) {
-      fprintf(
-          stderr, "(tr_ipos: %zu, tr_opos: %zu, if_ipos: %zu, if_opos: %zu)\n",
-          tr_recv_buf_pos, tr_send_buf_pos, if_read_buf_pos, if_write_buf_pos);
-      return EXIT_SUCCESS;
-    }
-
-    if ((nfds = select(nfds, &rfds, &wfds, NULL, NULL)) == -1) {
-      perror("select");
-      return EXIT_FAILURE;
-    }
-
-    // ---------------------------------------------------
-    // Transfer Recv from Channel -> Transfer Recv Buffer
-    // ---------------------------------------------------
-    if (FD_ISSET(tr_ifd, &rfds)) {
-      ssize_t rsiz = read(tr_ifd, tr_recv_buf + tr_recv_buf_pos,
-                          tr_recv_buf_size - tr_recv_buf_pos);
-      if (rsiz == -1) {
+    assert(frsz >= FRAME_LEN_SIZE);
+    (*(uint16_t *)buf) = htons(frsz);
+    const size_t trssz_expect = frsz + FRAME_LEN_SIZE;
+    size_t trssz_sent = 0;
+    while (trssz_sent < trssz_expect) {
+      ssize_t trssz = write(trsfd, buf + trssz_sent, trssz_expect - trssz_sent);
+      if (trssz == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
           continue;
         }
-        perror("read");
-        return EXIT_FAILURE;
+        perror("write to transfer");
+        return -1;
       }
-      if (rsiz == 0) {
-        return EXIT_SUCCESS;
-      }
-      tr_recv_buf_pos += rsiz;
-      continue;
+      trssz_sent += trssz;
     }
-
-    // ---------------------------------------------------
-    // Interface Write Buffer -> Interface Write to Device
-    // ---------------------------------------------------
-    if (FD_ISSET(if_write_fd, &wfds)) {
-      size_t packet_size = read_packet_size(if_write_buf);
-
-      ssize_t wsiz =
-          write(if_write_fd, &if_write_buf[IF_FRAME_SIZE_LEN], packet_size);
-      if (wsiz == -1) {
-        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
-            errno == EINPROGRESS) {
-          continue;
-        }
-        perror("write");
-        return EXIT_FAILURE;
-      }
-      if_write_buf_pos -= IF_FRAME_SIZE_LEN + wsiz;
-      memmove(if_write_buf, &if_write_buf[IF_FRAME_SIZE_LEN + wsiz],
-              if_write_buf_pos);
-      continue;
-    }
-
-    // ---------------------------------------------------
-    // Interface Read from Device -> Interface Read Buffer
-    // ---------------------------------------------------
-    if (FD_ISSET(if_read_fd, &rfds)) {
-      ssize_t rsiz = read(if_read_fd, if_read_buf + IF_FRAME_SIZE_LEN,
-                          if_read_buf_size - IF_FRAME_SIZE_LEN);
-      if (rsiz == -1) {
-        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
-            errno == EINPROGRESS) {
-          continue;
-        }
-        perror("read");
-        return EXIT_FAILURE;
-      }
-      if (rsiz == 0) {
-        return EXIT_SUCCESS;
-      }
-      write_packet_size(if_read_buf, rsiz);
-      if_read_buf_pos += IF_FRAME_SIZE_LEN + rsiz;
-      continue;
-    }
-
-    // ---------------------------------------------------
-    // Transfer Send Buffer -> Transfer Send to Channel
-    // ---------------------------------------------------
-    if (FD_ISSET(tr_ofd, &wfds)) {
-      ssize_t wsiz;
-
-      wsiz = write(tr_ofd, tr_send_buf, tr_send_buf_pos);
-      if (wsiz == -1) {
-        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
-            errno == EINPROGRESS) {
-          continue;
-        }
-        perror("write");
-        return EXIT_FAILURE;
-      }
-      tr_send_buf_pos -= wsiz;
-      if (tr_send_buf_pos > 0) {
-        memmove(tr_send_buf, tr_send_buf + wsiz, tr_send_buf_pos);
-      }
-      continue;
+    if (frsz == 0) {
+      return 0;
     }
   }
+}
+
+static int tuncat_tr_to_if(int trrfd, int ifwfd) {
+  assert(trrfd >= 0);
+  assert(ifwfd >= 0);
+  char buf[FRAME_LEN_MAX + FRAME_LEN_SIZE];
+
+  size_t trrsz_received = 0;
+  while (1) {
+    while (trrsz_received < FRAME_LEN_SIZE) {
+      ssize_t trrsz =
+          read(trrfd, buf + trrsz_received, sizeof(buf) - trrsz_received);
+      if (trrsz == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("read from transfer");
+        return -1;
+      }
+      if (trrsz == 0) {
+        return 0;
+      }
+      trrsz_received += trrsz;
+    }
+    assert(trrsz_received >= 2);
+    const size_t frsz = ntohs(*(uint16_t *)buf);
+    if (frsz == 0) {
+      return 0;
+    }
+    while (trrsz_received < frsz + 2) {
+      ssize_t trrsz =
+          read(trrfd, buf + trrsz_received, sizeof(buf) - trrsz_received);
+      if (trrsz == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("read from transfer");
+        return -1;
+      }
+      trrsz_received += trrsz;
+    }
+    ssize_t ifwsz = write(ifwfd, buf + FRAME_LEN_SIZE, frsz);
+    if (ifwsz == -1) {
+      if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+          errno == EINPROGRESS) {
+        continue;
+      }
+      perror("write to interface");
+      return -1;
+    }
+    if ((size_t)ifwsz < frsz) {
+      // TODO: inform short write?
+    }
+    memmove(buf, buf + frsz + 2, trrsz_received - (frsz + 2));
+    trrsz_received -= frsz + 2;
+  }
+}
+
+static void *tuncat_if_to_tr_thread(void *arg) {
+  int *fds = arg;
+  int ifrfd = fds[0];
+  int trsfd = fds[1];
+  return (void *)(intptr_t)tuncat_if_to_tr(ifrfd, trsfd);
+}
+
+static void *tuncat_tr_to_if_thread(void *arg) {
+  int *fds = arg;
+  int trrfd = fds[0];
+  int ifwfd = fds[1];
+  return (void *)(intptr_t)tuncat_tr_to_if(trrfd, ifwfd);
+}
+
+static int forward_packets(int tunfd, int tr_ifd, int tr_ofd) {
+  pthread_t th_if_to_tr, th_tr_to_if;
+
+  int fds_if_to_tr[2] = {tunfd, tr_ofd};
+  int fds_tr_to_if[2] = {tr_ifd, tunfd};
+
+  if (pthread_create(&th_if_to_tr, NULL, tuncat_if_to_tr_thread,
+                     fds_if_to_tr) != 0) {
+    perror("pthread_create");
+    return EXIT_FAILURE;
+  }
+
+  if (pthread_create(&th_tr_to_if, NULL, tuncat_tr_to_if_thread,
+                     fds_tr_to_if) != 0) {
+    perror("pthread_create");
+    return EXIT_FAILURE;
+  }
+
+  void *ret_if_to_tr, *ret_tr_to_if;
+  if (pthread_join(th_if_to_tr, &ret_if_to_tr) != 0) {
+    perror("pthread_join");
+    return EXIT_FAILURE;
+  }
+  if (pthread_join(th_tr_to_if, &ret_tr_to_if) != 0) {
+    perror("pthread_join");
+    return EXIT_FAILURE;
+  }
+
+  return (intptr_t)ret_if_to_tr == 0 && (intptr_t)ret_tr_to_if == 0
+             ? EXIT_SUCCESS
+             : EXIT_FAILURE;
 }
 
 int main(int argc, char *const argv[]) {
@@ -781,9 +546,6 @@ int main(int argc, char *const argv[]) {
       {"ipv4", no_argument, NULL, '4'},
       {"ipv6", no_argument, NULL, '6'},
       {"compress", no_argument, NULL, 'c'},
-      {"max-frame-size", required_argument, NULL, 'F'},
-      {"ifbuffer-size", required_argument, NULL, 'I'},
-      {"trbuffer-size", required_argument, NULL, 'T'},
       {"version", no_argument, NULL, 'v'},
       {"help", no_argument, NULL, 'h'},
       {0, 0, 0, 0},
@@ -792,7 +554,7 @@ int main(int argc, char *const argv[]) {
   memset(&opts, 0, sizeof(opts));
 
   int optindex = 0;
-  while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46cI:T:F:vh", longopts,
+  while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46cvh", longopts,
                             &optindex)) != -1) {
     switch (opt) {
     case 'm':
@@ -901,72 +663,6 @@ int main(int argc, char *const argv[]) {
       }
       opts.compflag = COMPFLAG_COMPRESS;
       break;
-    case 'F':
-      if (opts.max_frame_size != 0) {
-        fprintf(stderr, "Duplicated option -F\n");
-        print_usage(stderr, argc, argv);
-        return EXIT_FAILURE;
-      }
-      {
-        char *p;
-        opts.max_frame_size = strtoul(optarg, &p, 0);
-        if (p == optarg || *p != '\0') {
-          fprintf(stderr, "Invalid option value -F\n");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-        if (opts.max_frame_size < IF_MAX_FRAME_SIZE_MIN ||
-            opts.max_frame_size > IF_MAX_FRAME_SIZE_MAX) {
-          fprintf(stderr, "Invalid option value -F\n");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-      }
-      break;
-    case 'I':
-      if (opts.ifbuffer_size != 0) {
-        fprintf(stderr, "Duplicated option -I\n");
-        print_usage(stderr, argc, argv);
-        return EXIT_FAILURE;
-      }
-      {
-        char *p;
-        opts.ifbuffer_size = strtoul(optarg, &p, 0);
-        if (p == optarg || *p != '\0') {
-          fprintf(stderr, "Invalid option value -I\n");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-        if (opts.ifbuffer_size < IF_BUFFER_SIZE_MIN ||
-            opts.ifbuffer_size > IF_BUFFER_SIZE_MAX) {
-          fprintf(stderr, "Invalid option value -I\n");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-      }
-      break;
-    case 'T':
-      if (opts.trbuffer_size != 0) {
-        fprintf(stderr, "Duplicated option -T\n");
-        print_usage(stderr, argc, argv);
-        return EXIT_FAILURE;
-      }
-      {
-        char *p;
-        opts.trbuffer_size = strtoul(optarg, &p, 0);
-        if (p == optarg || *p != '\0') {
-          fprintf(stderr, "Invalid option value -T\n");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-        if (opts.trbuffer_size < TR_BUFFER_SIZE_MIN ||
-            opts.trbuffer_size > TR_BUFFER_SIZE_MAX) {
-          fprintf(stderr, "Invalid option value -T\n");
-          print_usage(stderr, argc, argv);
-          return EXIT_FAILURE;
-        }
-      }
-      break;
     case 'v':
       fprintf(stdout, "%s : Create tunnel interface\n", PACKAGE_STRING);
       return EXIT_SUCCESS;
@@ -1040,8 +736,7 @@ int main(int argc, char *const argv[]) {
     if (tunfd == -1) {
       return EXIT_FAILURE;
     }
-    return forward_packets(argc, argv, &opts, tunfd, STDIN_FILENO,
-                           STDOUT_FILENO);
+    return forward_packets(tunfd, STDIN_FILENO, STDOUT_FILENO);
   }
 
   {
@@ -1138,12 +833,12 @@ int main(int argc, char *const argv[]) {
 
       if (pid == 0) {
         close(sock);
-        return forward_packets(argc, argv, &opts, tunfd, csock, csock);
+        return forward_packets(tunfd, csock, csock);
       }
 
       close(csock);
     }
   } else {
-    return forward_packets(argc, argv, &opts, tunfd, sock, sock);
+    return forward_packets(tunfd, sock, sock);
   }
 }

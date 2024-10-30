@@ -21,8 +21,6 @@
 #define TR_BUFFER_SIZE_MIN IF_BUFFER_SIZE_MIN
 #define TR_BUFFER_SIZE_MAX IF_BUFFER_SIZE_MAX
 
-#define IF_FRAME_SIZE_LEN 2
-
 enum ifmode {
   IFMODE_UNSPEC = 0,
   IFMODE_L3 = 1,
@@ -72,9 +70,6 @@ struct tuncat_commandline_options {
   char *port;
   enum ipmode ipmode;
   enum compflag compflag;
-  size_t max_frame_size;
-  size_t ifbuffer_size;
-  size_t trbuffer_size;
 };
 
 #endif

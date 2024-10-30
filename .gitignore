@@ -23,3 +23,7 @@ Makefile.in
 
 /src/tuncat
 /tuncat.spec
+
+/docs/*/
+
+Doxyfile

@@ -24,4 +24,10 @@ void cleanbr(int status, void *arg);
 
 void cleanbr_sig(int sig);
 
+size_t read_if_frame_size(const char *ifrbuf, size_t ifrpos, size_t *ifrfsizep);
+
+size_t write_if_frame_size(char *ifwbuf, size_t ifwlen, size_t ifwrfsize);
+
+#define IF_FRAME_SIZE_LEN 2
+
 #endif // __TUNCAT_IF_H__

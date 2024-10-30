@@ -207,3 +207,18 @@ void cleanbr_sig(int sig) {
     free((void *)brname);
   }
 }
+
+size_t read_if_frame_size(const char *ifrbuf, size_t ifrpos,
+                          size_t *ifrfsizep) {
+  if (ifrpos < IF_FRAME_SIZE_LEN)
+    return 0;
+  *ifrfsizep = *(uint16_t *)&ifrbuf[0];
+  return IF_FRAME_SIZE_LEN;
+}
+
+size_t write_if_frame_size(char *ifwbuf, size_t ifwlen, size_t ifwfsize) {
+  if (ifwlen < IF_FRAME_SIZE_LEN)
+    return 0;
+  *(uint16_t *)&ifwbuf[0] = ifwfsize;
+  return IF_FRAME_SIZE_LEN;
+}
