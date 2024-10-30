@@ -11,16 +11,6 @@
 
 #include <stdio.h>
 
-#define IF_MAX_FRAME_SIZE_DEF 65535
-#define IF_MAX_FRAME_SIZE_MIN 128
-#define IF_MAX_FRAME_SIZE_MAX 65535
-
-#define IF_BUFFER_SIZE_MIN 128
-#define IF_BUFFER_SIZE_MAX 16777216
-
-#define TR_BUFFER_SIZE_MIN IF_BUFFER_SIZE_MIN
-#define TR_BUFFER_SIZE_MAX IF_BUFFER_SIZE_MAX
-
 enum ifmode {
   IFMODE_UNSPEC = 0,
   IFMODE_L3 = 1,
@@ -59,7 +49,7 @@ enum compflag {
   COMPFLAG_COMPRESS = 2,
 };
 
-struct tuncat_commandline_options {
+struct tuncat_optspec {
   enum ifmode ifmode;
   char *ifname;
   char *addr;

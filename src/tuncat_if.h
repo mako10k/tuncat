@@ -3,31 +3,29 @@
 
 #include "tuncat.h"
 
-int change_ifflags(int sock, const char *ifname, int flags_clear,
-                   int flags_set);
+int tuncat_if_change_flags(int sock, const char *ifname, int flags_clear,
+                           int flags_set);
 
-int create_tunif(int sock, const char *ifname, enum ifmode ifmode);
+int tuncat_if_create_tun_interface(int sock, const char *ifname,
+                                   enum ifmode ifmode);
 
-int get_ifindex(int sock, const char *ifname);
+int tuncat_if_get_index(int sock, const char *ifname);
 
-int create_bridge(int sock, const char *brname);
+int tuncat_if_create_bridge(int sock, const char *brname);
 
-int delete_bridge(int sock, const char *brname);
+int tuncat_if_delete_bridge(int sock, const char *brname);
 
-int add_bridge_member(int sock, const char *brname, const char *ifname);
+int tuncat_if_add_bridge_member(int sock, const char *brname,
+                                const char *ifname);
 
-void add_brname(const char *brname);
+void tuncat_if_register_created_brname(const char *brname);
 
-const char *remove_brname(void);
+const char *tuncat_if_finalize_created_brname(void);
 
-void cleanbr(int status, void *arg);
+void tuncat_if_finalize_created_brname_on_exit(int status, void *arg);
 
-void cleanbr_sig(int sig);
+void tuncat_if_finalize_created_brname_on_signal(int sig);
 
-size_t read_if_frame_size(const char *ifrbuf, size_t ifrpos, size_t *ifrfsizep);
-
-size_t write_if_frame_size(char *ifwbuf, size_t ifwlen, size_t ifwrfsize);
-
-#define IF_FRAME_SIZE_LEN 2
+int tuncat_if_init(struct tuncat_optspec *optsp);
 
 #endif // __TUNCAT_IF_H__
