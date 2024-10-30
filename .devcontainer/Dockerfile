@@ -18,7 +18,7 @@ RUN  apt-get update \
       > /etc/apt/sources.list.d/github-cli.list \
   && apt-get update \
   && apt-get -y install --no-install-recommends \
-       apt-utils autoconf automake build-essential gh git \
+       apt-utils autoconf automake build-essential doxygen gh git graphviz \
        iproute2 make pkg-config libcap2-bin libsnappy-dev libtool ssh sudo \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* \
