@@ -10,6 +10,7 @@
 #include <getopt.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <snappy-c.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,114 +83,394 @@ static void print_usage(FILE *fp, int argc, char *const argv[]) {
 
 #define FRAME_LEN_MAX 65536
 #define FRAME_LEN_SIZE 2
+#define COMP_LEN_SIZE_MAX 3
 
-static int tuncat_if_to_tr(int ifrfd, int trsfd) {
-  assert(ifrfd >= 0);
-  assert(trsfd >= 0);
+/**
+ * **tuncat_raw_to_frame** : read raw data from fd_raw and write frame data to
+ * fd_frame
+ *
+ * @param fd_raw    file descriptor for raw data
+ * @param fd_frame  file descriptor for frame data
+ * @return 0 on success, -1 on failure
+ */
+static int tuncat_raw_to_frame(int fd_raw, int fd_frame) {
+  assert(fd_raw >= 0);
+  assert(fd_frame >= 0);
   char buf[FRAME_LEN_MAX + FRAME_LEN_SIZE];
 
   while (1) {
-    ssize_t frsz = read(ifrfd, buf + FRAME_LEN_SIZE, FRAME_LEN_MAX);
-    if (frsz == -1) {
+    ssize_t size_raw = read(fd_raw, buf + FRAME_LEN_SIZE, FRAME_LEN_MAX);
+    if (size_raw == -1) {
       if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
           errno == EINPROGRESS) {
         continue;
       }
-      perror("read from interface");
+      perror("read raw");
       return -1;
     }
-    assert(frsz >= FRAME_LEN_SIZE);
-    (*(uint16_t *)buf) = htons(frsz);
-    const size_t trssz_expect = frsz + FRAME_LEN_SIZE;
-    size_t trssz_sent = 0;
-    while (trssz_sent < trssz_expect) {
-      ssize_t trssz = write(trsfd, buf + trssz_sent, trssz_expect - trssz_sent);
-      if (trssz == -1) {
+    assert(size_raw >= FRAME_LEN_SIZE);
+    (*(uint16_t *)buf) = htons(size_raw);
+    const size_t size_frame_to_write = size_raw + FRAME_LEN_SIZE;
+    size_t size_frame_write_pos = 0;
+    while (size_frame_write_pos < size_frame_to_write) {
+      ssize_t size_frame_write =
+          write(fd_frame, buf + size_frame_write_pos,
+                size_frame_to_write - size_frame_write_pos);
+      if (size_frame_write == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
           continue;
         }
-        perror("write to transfer");
+        perror("write frame");
         return -1;
       }
-      trssz_sent += trssz;
+      size_frame_write_pos += size_frame_write;
     }
-    if (frsz == 0) {
+    if (size_raw == 0) {
       return 0;
     }
   }
 }
 
-static int tuncat_tr_to_if(int trrfd, int ifwfd) {
-  assert(trrfd >= 0);
-  assert(ifwfd >= 0);
+/**
+ * **tuncat_frame_to_raw** : read frame data from fd_frame and write raw data to
+ * fd_raw
+ *
+ * @param fd_frame  file descriptor for frame data
+ * @param fd_raw    file descriptor for raw data
+ * @return 0 on success, -1 on failure
+ */
+static int tuncat_frame_to_raw(int fd_frame, int fd_raw) {
+  assert(fd_frame >= 0);
+  assert(fd_raw >= 0);
   char buf[FRAME_LEN_MAX + FRAME_LEN_SIZE];
 
-  size_t trrsz_received = 0;
+  size_t size_frame_read_pos = 0;
   while (1) {
-    while (trrsz_received < FRAME_LEN_SIZE) {
-      ssize_t trrsz =
-          read(trrfd, buf + trrsz_received, sizeof(buf) - trrsz_received);
-      if (trrsz == -1) {
+    while (size_frame_read_pos < FRAME_LEN_SIZE) {
+      ssize_t size_frame_read = read(fd_frame, buf + size_frame_read_pos,
+                                     sizeof(buf) - size_frame_read_pos);
+      if (size_frame_read == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
           continue;
         }
-        perror("read from transfer");
+        perror("read frame");
         return -1;
       }
-      if (trrsz == 0) {
+      if (size_frame_read == 0) {
         return 0;
       }
-      trrsz_received += trrsz;
+      size_frame_read_pos += size_frame_read;
     }
-    assert(trrsz_received >= 2);
-    const size_t frsz = ntohs(*(uint16_t *)buf);
-    if (frsz == 0) {
+    assert(size_frame_read_pos >= FRAME_LEN_SIZE);
+    const size_t size_raw_to_write = ntohs(*(uint16_t *)buf);
+    if (size_raw_to_write == 0) {
       return 0;
     }
-    while (trrsz_received < frsz + 2) {
-      ssize_t trrsz =
-          read(trrfd, buf + trrsz_received, sizeof(buf) - trrsz_received);
-      if (trrsz == -1) {
+    const size_t size_frame_to_read = size_raw_to_write + FRAME_LEN_SIZE;
+    while (size_frame_read_pos < size_frame_to_read) {
+      ssize_t size_frame_read = read(fd_frame, buf + size_frame_read_pos,
+                                     sizeof(buf) - size_frame_read_pos);
+      if (size_frame_read == -1) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
             errno == EINPROGRESS) {
           continue;
         }
-        perror("read from transfer");
+        perror("read frame");
         return -1;
       }
-      trrsz_received += trrsz;
+      size_frame_read_pos += size_frame_read;
     }
-    ssize_t ifwsz = write(ifwfd, buf + FRAME_LEN_SIZE, frsz);
-    if (ifwsz == -1) {
+    ssize_t size_raw = write(fd_raw, buf + FRAME_LEN_SIZE, size_raw_to_write);
+    if (size_raw == -1) {
       if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
           errno == EINPROGRESS) {
         continue;
       }
-      perror("write to interface");
+      perror("write raw");
       return -1;
     }
-    if ((size_t)ifwsz < frsz) {
+    if ((size_t)size_raw < size_raw_to_write) {
       // TODO: inform short write?
     }
-    memmove(buf, buf + frsz + 2, trrsz_received - (frsz + 2));
-    trrsz_received -= frsz + 2;
+    const size_t size_frame_transfered = size_raw_to_write + FRAME_LEN_SIZE;
+    memmove(buf, buf + size_frame_transfered,
+            size_frame_read_pos - size_frame_transfered);
+    size_frame_read_pos -= size_frame_transfered;
   }
 }
 
-static void *tuncat_if_to_tr_thread(void *arg) {
+/**
+ * **tuncat_comp_len_read** : read compressed length from buf
+ *
+ * @param buf     buffer
+ * @param size    buffer size
+ * @param rsizep  read size
+ * @return compressed length
+ */
+static int tuncat_comp_len_read(const char *buf, size_t size, size_t *rsizep) {
+  assert(rsizep != NULL);
+  if (size <= 0)
+    return 0;
+  size_t rsize = buf[0] & 0x7f;
+  if ((buf[0] & 0x80) == 0) {
+    *rsizep = rsize;
+    return 1;
+  }
+  if (size <= 1)
+    return 0;
+  rsize |= (buf[1] & 0x7f) << 7;
+  if ((buf[1] & 0x80) == 0) {
+    *rsizep = rsize;
+    return 2;
+  }
+  if (size <= 2)
+    return 0;
+  rsize |= (buf[2] & 0xff) << 14;
+  *rsizep = rsize;
+  return 3;
+}
+
+/**
+ * **tuncat_comp_len_write** : write compressed length to buf
+ *
+ * @param buf    buffer
+ * @param size   buffer size
+ * @param rsize  compressed length
+ * @return written size
+ */
+static size_t tuncat_comp_len_write(char *buf, size_t size, size_t rsize) {
+  if (size < 1)
+    return 0;
+  if (rsize < 0x80) {
+    buf[0] = rsize;
+    return 1;
+  }
+  if (size < 2)
+    return 0;
+  if (rsize < 0x4000) {
+    buf[0] = 0x80 | (rsize & 0x7f);
+    buf[1] = rsize >> 7;
+    return 2;
+  }
+  if (size < 3)
+    return 0;
+  if (rsize < 0x200000) {
+    buf[0] = 0x80 | (rsize & 0x7f);
+    buf[1] = 0x80 | ((rsize >> 7) & 0x7f);
+    buf[2] = rsize >> 14;
+    return 3;
+  }
+  return -1;
+}
+
+/**
+ * **tuncat_comp_len_size** : calculate compressed length size
+ *
+ * @param size  compressed length
+ * @return compressed length size
+ */
+static size_t tuncat_comp_len_size(size_t size) {
+  if (size < 0x80)
+    return 1;
+  if (size < 0x4000)
+    return 2;
+  if (size < 0x200000)
+    return 3;
+  return -1;
+}
+
+/**
+ * **tuncat_frame_to_comp** : read frame data from fd_frame and write compressed
+ * data to fd_comp
+ *
+ * @param fd_frame  file descriptor for frame data
+ * @param fd_comp   file descriptor for compressed data
+ * @return 0 on success, -1 on failure
+ */
+static int tuncat_frame_to_comp(int fd_frame, int fd_comp) {
+  assert(fd_frame >= 0);
+  assert(fd_comp >= 0);
+  const size_t COMP_LEN_MAX = snappy_max_compressed_length(FRAME_LEN_MAX);
+  char ibuf[FRAME_LEN_MAX + FRAME_LEN_SIZE];
+  char cbuf[COMP_LEN_MAX];
+  char obuf[COMP_LEN_MAX + COMP_LEN_SIZE_MAX];
+  size_t size_frame_read_pos = 0;
+  while (1) {
+    while (size_frame_read_pos < FRAME_LEN_SIZE) {
+      ssize_t size_frame_read = read(fd_frame, ibuf + size_frame_read_pos,
+                                     sizeof(ibuf) - size_frame_read_pos);
+      if (size_frame_read == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("read frame");
+        return -1;
+      }
+      if (size_frame_read == 0) {
+        return 0;
+      }
+      size_frame_read_pos += size_frame_read;
+    }
+    size_t size_frame = ntohs(*(uint16_t *)ibuf);
+    while (size_frame_read_pos < size_frame + FRAME_LEN_SIZE) {
+      ssize_t size_frame_read = read(fd_frame, ibuf + size_frame_read_pos,
+                                     sizeof(ibuf) - size_frame_read_pos);
+      if (size_frame_read == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("read frame");
+        return -1;
+      }
+      if (size_frame_read == 0) {
+        return 0;
+      }
+      size_frame_read_pos += size_frame_read;
+    }
+    size_t size_comp = sizeof(cbuf);
+    if (snappy_compress(ibuf + FRAME_LEN_SIZE, size_frame, cbuf, &size_comp) !=
+        SNAPPY_OK) {
+      fprintf(stderr, "snappy_compress failed\n");
+      return -1;
+    }
+    size_t size_comp_len = tuncat_comp_len_size(size_comp);
+    assert(size_comp_len != (size_t)-1);
+    size_t size_comp_len_written =
+        tuncat_comp_len_write(obuf, sizeof(obuf), size_comp);
+    assert(size_comp_len_written == size_comp_len);
+    size_t size_comp_write_pos = 0;
+    const size_t size_comp_to_write = size_comp_len + size_comp;
+    while (size_comp_write_pos < size_comp_to_write) {
+      ssize_t size_comp_write = write(fd_comp, obuf + size_comp_write_pos,
+                                      size_comp_to_write - size_comp_write_pos);
+      if (size_comp_write == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("write comp");
+        return -1;
+      }
+      size_comp_write_pos += size_comp_write;
+    }
+    const size_t size_frame_transfered = size_frame + FRAME_LEN_SIZE;
+    memcpy(ibuf, ibuf + size_frame_transfered,
+           size_frame_read_pos - size_frame_transfered);
+    size_frame_read_pos -= size_frame_transfered;
+  }
+}
+
+/**
+ * **tuncat_comp_to_frame** : read compressed data from fd_comp and write frame
+ * data to fd_frame
+ *
+ * @param fd_comp   file descriptor for compressed data
+ * @param fd_frame  file descriptor for frame data
+ * @return 0 on success, -1 on failure
+ */
+static int tuncat_comp_to_frame(int fd_comp, int fd_frame) {
+  assert(fd_comp >= 0);
+  assert(fd_frame >= 0);
+  const size_t COMP_LEN_MAX = snappy_max_compressed_length(FRAME_LEN_MAX);
+  char ibuf[COMP_LEN_MAX + COMP_LEN_SIZE_MAX];
+  char obuf[FRAME_LEN_MAX + FRAME_LEN_SIZE];
+  size_t size_comp_read_pos = 0;
+  while (1) {
+    size_t size_comp_len = 0;
+    size_t size_comp = 0;
+    while (1) {
+      ssize_t size_comp_read = read(fd_comp, ibuf + size_comp_read_pos,
+                                    sizeof(ibuf) - size_comp_read_pos);
+      if (size_comp_read == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("read comp");
+        return -1;
+      }
+      if (size_comp_read == 0) {
+        return 0;
+      }
+      size_comp_read_pos += size_comp_read;
+      size_comp_len =
+          tuncat_comp_len_read(ibuf, size_comp_read_pos, &size_comp);
+      if (size_comp_len == 0) {
+        continue;
+      }
+      if (size_comp_len == (size_t)-1) {
+        fprintf(stderr, "tuncat_comp_len_read failed\n");
+        return -1;
+      }
+      break;
+    }
+    while (size_comp_read_pos < size_comp_len + size_comp) {
+      ssize_t size_comp_read = read(fd_comp, ibuf + size_comp_read_pos,
+                                    sizeof(ibuf) - size_comp_read_pos);
+      if (size_comp_read == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("read comp");
+        return -1;
+      }
+      if (size_comp_read == 0) {
+        return 0;
+      }
+      size_comp_read_pos += size_comp_read;
+    }
+    size_t size_frame = sizeof(obuf);
+    if (snappy_uncompressed_length(ibuf + size_comp_len, size_comp,
+                                   &size_frame) != SNAPPY_OK) {
+      fprintf(stderr, "snappy_uncompressed_length failed\n");
+      return -1; // TODO: reset stream
+    }
+    assert(size_frame <= sizeof(obuf) - FRAME_LEN_SIZE);
+    if (snappy_uncompress(ibuf + size_comp_len, size_comp,
+                          obuf + FRAME_LEN_SIZE, &size_frame) != SNAPPY_OK) {
+      fprintf(stderr, "snappy_uncompress failed\n");
+      return -1; // TODO: reset stream
+    }
+    (*(uint16_t *)obuf) = htons(size_frame);
+    size_t size_frame_written = 0;
+    while (size_frame_written < size_frame + FRAME_LEN_SIZE) {
+      ssize_t size_frame_write =
+          write(fd_frame, obuf + size_frame_written,
+                size_frame + FRAME_LEN_SIZE - size_frame_written);
+      if (size_frame_write == -1) {
+        if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK ||
+            errno == EINPROGRESS) {
+          continue;
+        }
+        perror("write frame");
+        return -1;
+      }
+      size_frame_written += size_frame_write;
+    }
+    const size_t size_comp_transfered = size_comp_len + size_comp;
+    memmove(ibuf, ibuf + size_comp_transfered,
+            size_comp_read_pos - size_comp_transfered);
+    size_comp_read_pos -= size_comp_transfered;
+  }
+}
+
+static void *tuncat_raw_to_frame_thread(void *arg) {
   int *fds = arg;
   int ifrfd = fds[0];
   int trsfd = fds[1];
-  return (void *)(intptr_t)tuncat_if_to_tr(ifrfd, trsfd);
+  return (void *)(intptr_t)tuncat_raw_to_frame(ifrfd, trsfd);
 }
 
-static void *tuncat_tr_to_if_thread(void *arg) {
+static void *tuncat_frame_to_raw_thread(void *arg) {
   int *fds = arg;
   int trrfd = fds[0];
   int ifwfd = fds[1];
-  return (void *)(intptr_t)tuncat_tr_to_if(trrfd, ifwfd);
+  return (void *)(intptr_t)tuncat_frame_to_raw(trrfd, ifwfd);
 }
 
 static int forward_packets(int tunfd, int tr_ifd, int tr_ofd) {
@@ -198,13 +479,13 @@ static int forward_packets(int tunfd, int tr_ifd, int tr_ofd) {
   int fds_if_to_tr[2] = {tunfd, tr_ofd};
   int fds_tr_to_if[2] = {tr_ifd, tunfd};
 
-  if (pthread_create(&th_if_to_tr, NULL, tuncat_if_to_tr_thread,
+  if (pthread_create(&th_if_to_tr, NULL, tuncat_raw_to_frame_thread,
                      fds_if_to_tr) != 0) {
     perror("pthread_create");
     return EXIT_FAILURE;
   }
 
-  if (pthread_create(&th_tr_to_if, NULL, tuncat_tr_to_if_thread,
+  if (pthread_create(&th_tr_to_if, NULL, tuncat_frame_to_raw_thread,
                      fds_tr_to_if) != 0) {
     perror("pthread_create");
     return EXIT_FAILURE;
