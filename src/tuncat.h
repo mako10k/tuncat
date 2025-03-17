@@ -71,6 +71,7 @@ struct tuncat_commandline_options {
   char *node;
   char *port;
   enum ipmode ipmode;
+  int mptcp;
   enum compflag compflag;
   size_t max_frame_size;
   size_t ifbuffer_size;

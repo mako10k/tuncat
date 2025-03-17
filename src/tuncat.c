@@ -10,9 +10,11 @@
 #include <linux/if_tun.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/mptcp.h>
 #include <linux/sockios.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <snappy-c.h>
 #include <stdio.h>
@@ -121,6 +123,8 @@ void print_usage(FILE *fp, int argc, char *const argv[]) {
   fprintf(fp, "  -4,--ipv4                   Force ipv4       (TCP server or "
               "TCP client)\n");
   fprintf(fp, "  -6,--ipv6                   Force ipv6       (TCP server or "
+              "TCP client)\n");
+  fprintf(fp, "  -M,--mptcp                  Enable MPTCP     (TCP server or "
               "TCP client)\n");
   fprintf(fp, "\n");
   fprintf(fp, "  -c,--compress               Compress mode\n");
@@ -939,6 +943,7 @@ int main(int argc, char *const argv[]) {
       {"port", required_argument, NULL, 'p'},
       {"ipv4", no_argument, NULL, '4'},
       {"ipv6", no_argument, NULL, '6'},
+      {"mptcp", no_argument, NULL, 'M'},
       {"compress", no_argument, NULL, 'c'},
       {"max-frame-size", required_argument, NULL, 'F'},
       {"ifbuffer-size", required_argument, NULL, 'I'},
@@ -951,8 +956,8 @@ int main(int argc, char *const argv[]) {
   memset(&opts, 0, sizeof(opts));
 
   int optindex = 0;
-  while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46cI:T:F:vh", longopts,
-                            &optindex)) != -1) {
+  while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46McI:T:F:vh",
+                            longopts, &optindex)) != -1) {
     switch (opt) {
     case 'm':
       if (opts.ifmode != IFMODE_UNSPEC) {
@@ -1051,6 +1056,14 @@ int main(int argc, char *const argv[]) {
         return EXIT_FAILURE;
       }
       opts.ipmode = IPMODE_IPV6;
+      break;
+    case 'M':
+      if (opts.mptcp) {
+        fprintf(stderr, "Duplicated option -M\n");
+        print_usage(stderr, argc, argv);
+        return EXIT_FAILURE;
+      }
+      opts.mptcp = 1;
       break;
     case 'c':
       if (opts.compflag != COMPFLAG_UNSPEC) {
@@ -1233,7 +1246,11 @@ int main(int argc, char *const argv[]) {
     }
 
     for (rp = airp; rp; rp = rp->ai_next) {
-      sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      int protocol = rp->ai_protocol;
+      if (opts.mptcp && protocol == IPPROTO_TCP) {
+        protocol = IPPROTO_MPTCP;
+      }
+      sock = socket(rp->ai_family, rp->ai_socktype, protocol);
       if (sock == -1)
         continue;
       if (opts.trmode == TRMODE_SERVER) {
@@ -1254,7 +1271,8 @@ int main(int argc, char *const argv[]) {
     }
 
     if (rp == NULL) {
-      fprintf(stderr, "Invalid host or port address\n");
+      perror("socket");
+      freeaddrinfo(airp);
       return EXIT_FAILURE;
     }
 
