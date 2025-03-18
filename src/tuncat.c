@@ -146,12 +146,13 @@ int change_ifflags(int sock, const char *ifname, int flags_clear,
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+  strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+  ifr.ifr_name[IFNAMSIZ - 1] = '\0';
   if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
     perror("Cannot get interface flags");
     return -1;
   }
-  typeof(ifr.ifr_flags) flags_new = (ifr.ifr_flags & ~flags_clear) | flags_set;
+  short flags_new = (ifr.ifr_flags & ~flags_clear) | flags_set;
   if (flags_new != ifr.ifr_flags) {
     ifr.ifr_flags = flags_new;
     if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
@@ -188,13 +189,14 @@ int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
   ifr.ifr_flags |= IFF_NO_PI;
 #endif
 
-  if (ifname) {
+  if (0 < strlen(ifname) && strlen(ifname) < IFNAMSIZ) {
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
   }
   if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
     perror("Error while creating tunnel interface");
     return -1;
   }
+  strncpy(ifname, ifr.ifr_name, IFNAMSIZ);
 
   if (change_ifflags(sock, ifr.ifr_name, 0, IFF_UP | IFF_RUNNING) < 0) {
     return -1;
@@ -261,7 +263,7 @@ int add_bridge_member(int sock, const char *brname, const char *ifname) {
 
 char *brname = NULL;
 
-void cleanbr() {
+void cleanbr(void) {
   if (brname) {
     int sock;
 
@@ -373,6 +375,9 @@ int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
 }
 
 int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
+  assert(sock >= 0);
+  assert(ifname != NULL);
+  assert(addrstr != NULL);
   struct ifreq ifr;
   struct sockaddr_in addr, mask, nwork, bcast;
 
@@ -487,11 +492,15 @@ int init_if(struct tuncat_commandline_options *optsp) {
     return EXIT_FAILURE;
   }
 
-  int tunfd = create_tunif(sock, optsp->ifname, optsp->ifmode);
+  char tunname[IFNAMSIZ];
+  if (optsp->ifname != NULL) {
+    strncpy(tunname, optsp->ifname, IFNAMSIZ - 1);
+    tunname[IFNAMSIZ - 1] = '\0';
+  }
+  int tunfd = create_tunif(sock, tunname, optsp->ifmode);
   if (tunfd == -1) {
     return EXIT_FAILURE;
   }
-  const char *tunname = optsp->ifname;
 
   if (optsp->brname == NULL) {
     if (optsp->addr != NULL) {
@@ -513,7 +522,7 @@ int init_if(struct tuncat_commandline_options *optsp) {
       atexit(cleanbr);
       struct sigaction sa;
       memset(&sa, 0, sizeof(sa));
-      sa.sa_handler = cleanbr;
+      sa.sa_handler = cleanbr_sig;
       sigaction(SIGINT, &sa, NULL);
       sigaction(SIGTERM, &sa, NULL);
     }
@@ -537,7 +546,8 @@ int init_if(struct tuncat_commandline_options *optsp) {
       char *braddifname = alloca(len + 1);
       char *ifname, *ifn;
 
-      ifname = strcpy(braddifname, optsp->braddifname);
+      ifname = strncpy(braddifname, optsp->braddifname, IFNAMSIZ - 1);
+      braddifname[IFNAMSIZ - 1] = '\0';
       for (;;) {
         if ((ifn = strchr(ifname, ','))) {
           *ifn = '\0';
@@ -575,12 +585,17 @@ int forward_packets(int argc, char *const argv[],
 
   enum compflag compflag = optsp->compflag;
 
-  size_t max_frame_size = optsp->max_frame_size ?: IF_MAX_FRAME_SIZE_DEF;
+  size_t max_frame_size =
+      optsp->max_frame_size ? optsp->max_frame_size : IF_MAX_FRAME_SIZE_DEF;
 
-  const size_t if_read_buf_size = optsp->ifbuffer_size ?: 2 * max_frame_size;
-  const size_t if_write_buf_size = optsp->ifbuffer_size ?: 2 * max_frame_size;
-  const size_t tr_recv_buf_size = optsp->trbuffer_size ?: if_write_buf_size;
-  const size_t tr_send_buf_size = optsp->trbuffer_size ?: if_read_buf_size;
+  const size_t if_read_buf_size =
+      optsp->ifbuffer_size ? optsp->ifbuffer_size : 2 * max_frame_size;
+  const size_t if_write_buf_size =
+      optsp->ifbuffer_size ? optsp->ifbuffer_size : 2 * max_frame_size;
+  const size_t tr_recv_buf_size =
+      optsp->trbuffer_size ? optsp->trbuffer_size : if_write_buf_size;
+  const size_t tr_send_buf_size =
+      optsp->trbuffer_size ? optsp->trbuffer_size : if_read_buf_size;
 
   char if_read_buf[if_read_buf_size];
   char if_write_buf[if_write_buf_size];
@@ -741,8 +756,7 @@ int forward_packets(int argc, char *const argv[],
           if_write_buf_size - if_write_buf_pos;
 
       // calculate required size of interface write buffer
-      size_t if_write_buf_required_size =
-          IF_FRAME_SIZE_LEN + tr_recv_packet_size;
+      size_t if_write_buf_required_size;
 
       if (compflag == COMPFLAG_COMPRESS) {
         // calculate required size of interface write buffer with compression
@@ -833,7 +847,8 @@ int forward_packets(int argc, char *const argv[],
       return EXIT_SUCCESS;
     }
 
-    if ((nfds = select(nfds, &rfds, &wfds, NULL, NULL)) == -1) {
+    nfds = select(nfds, &rfds, &wfds, NULL, NULL);
+    if (nfds == -1) {
       perror("select");
       return EXIT_FAILURE;
     }
@@ -931,7 +946,7 @@ int main(int argc, char *const argv[]) {
   int sock;
 
   int opt;
-  struct tuncat_commandline_options opts;
+  struct tuncat_commandline_options opts = {0};
   struct option longopts[] = {
       {"ifname", required_argument, NULL, 'n'},
       {"ifaddress", required_argument, NULL, 'a'},
@@ -953,13 +968,13 @@ int main(int argc, char *const argv[]) {
       {0, 0, 0, 0},
   };
 
-  memset(&opts, 0, sizeof(opts));
-
   int optindex = 0;
   while ((opt = getopt_long(argc, argv, "m:n:b:i:a:t:l:p:46McI:T:F:vh",
                             longopts, &optindex)) != -1) {
     switch (opt) {
+
     case 'm':
+      assert(optarg != NULL);
       if (opts.ifmode != IFMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -m\n");
         print_usage(stderr, argc, argv);
@@ -975,7 +990,9 @@ int main(int argc, char *const argv[]) {
         return EXIT_FAILURE;
       }
       break;
+
     case 'n':
+      assert(optarg != NULL);
       if (opts.ifname != NULL) {
         fprintf(stderr, "Duplicated option -n\n");
         print_usage(stderr, argc, argv);
@@ -983,7 +1000,9 @@ int main(int argc, char *const argv[]) {
       }
       opts.ifname = optarg;
       break;
+
     case 'a':
+      assert(optarg != NULL);
       if (opts.addr != NULL) {
         fprintf(stderr, "Duplicated option -a\n");
         print_usage(stderr, argc, argv);
@@ -991,7 +1010,9 @@ int main(int argc, char *const argv[]) {
       }
       opts.addr = optarg;
       break;
+
     case 'b':
+      assert(optarg != NULL);
       if (opts.brname != NULL) {
         fprintf(stderr, "Duplicated option -b\n");
         print_usage(stderr, argc, argv);
@@ -999,7 +1020,9 @@ int main(int argc, char *const argv[]) {
       }
       opts.brname = optarg;
       break;
+
     case 'i':
+      assert(optarg != NULL);
       if (opts.braddifname != NULL) {
         fprintf(stderr, "Duplicated option -i\n");
         print_usage(stderr, argc, argv);
@@ -1007,7 +1030,9 @@ int main(int argc, char *const argv[]) {
       }
       opts.braddifname = optarg;
       break;
+
     case 't':
+      assert(optarg != NULL);
       if (opts.trmode != TRMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -t\n");
         print_usage(stderr, argc, argv);
@@ -1025,7 +1050,9 @@ int main(int argc, char *const argv[]) {
         return EXIT_FAILURE;
       }
       break;
+
     case 'l':
+      assert(optarg != NULL);
       if (opts.node != NULL) {
         fprintf(stderr, "Duplicated option -l\n");
         print_usage(stderr, argc, argv);
@@ -1033,7 +1060,9 @@ int main(int argc, char *const argv[]) {
       }
       opts.node = optarg;
       break;
+
     case 'p':
+      assert(optarg != NULL);
       if (opts.port != NULL) {
         fprintf(stderr, "Duplicated option -p\n");
         print_usage(stderr, argc, argv);
@@ -1041,6 +1070,7 @@ int main(int argc, char *const argv[]) {
       }
       opts.port = optarg;
       break;
+
     case '4':
       if (opts.ipmode != IPMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -4 or -6\n");
@@ -1049,6 +1079,7 @@ int main(int argc, char *const argv[]) {
       }
       opts.ipmode = IPMODE_IPV4;
       break;
+
     case '6':
       if (opts.ipmode != IPMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -4 or -6\n");
@@ -1057,6 +1088,7 @@ int main(int argc, char *const argv[]) {
       }
       opts.ipmode = IPMODE_IPV6;
       break;
+
     case 'M':
       if (opts.mptcp) {
         fprintf(stderr, "Duplicated option -M\n");
@@ -1065,6 +1097,7 @@ int main(int argc, char *const argv[]) {
       }
       opts.mptcp = 1;
       break;
+
     case 'c':
       if (opts.compflag != COMPFLAG_UNSPEC) {
         fprintf(stderr, "Duplicated option -c\n");
@@ -1073,6 +1106,7 @@ int main(int argc, char *const argv[]) {
       }
       opts.compflag = COMPFLAG_COMPRESS;
       break;
+
     case 'F':
       if (opts.max_frame_size != 0) {
         fprintf(stderr, "Duplicated option -F\n");

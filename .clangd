@@ -1,0 +1,11 @@
+If:
+  PathMatch: src/.*\.(c|h)$
+
+CompileFlags:
+  Add:
+    - -xc
+    - -Wall
+    - -Wextra
+    - -Werror
+    - -pedantic
+    - -std=gnu11
