@@ -1,11 +1,14 @@
+#include "tuncat.h"
 #include <alloca.h>
 #include <arpa/inet.h>
 #include <assert.h>
-#include <fcntl.h>
-#include <net/if.h> // must be before <linux/if.h>
-
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+// clang-format off
+// <net/if.h> must be before <linux/if.h>
+#include <net/if.h>
+// clang-format on
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <linux/ip.h>
@@ -28,11 +31,17 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "tuncat.h"
-
 static int inet6_net_pton(int af, const char *cp, void *buf, size_t len) {
   if (af != AF_INET6) {
     errno = EAFNOSUPPORT;
+    return -1;
+  }
+  if (cp == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (len < sizeof(struct in6_addr)) {
+    errno = ENOSPC;
     return -1;
   }
 
@@ -61,7 +70,7 @@ static int inet6_net_pton(int af, const char *cp, void *buf, size_t len) {
   }
 end:
   memcpy(buf, &addr6, len < sizeof(addr6) ? len : sizeof(addr6));
-  return bits;
+  return (int)bits;
 }
 
 static int inet_net_pton_orig(int af, const char *cp, void *buf, size_t len) {
@@ -75,70 +84,71 @@ static int inet_net_pton_orig(int af, const char *cp, void *buf, size_t len) {
 
 #define inet_net_pton inet_net_pton_orig
 
-void print_usage(FILE *fp, int argc, char *const argv[]) {
-  (void)argc;
-  fprintf(fp, "\n");
-  fprintf(fp, "Usage:\n");
-  fprintf(fp, "  %s [options]\n", argv[0]);
-  fprintf(fp, "\n");
+void print_usage(FILE *fp) {
+  extern char *program_invocation_name;
+  fprintf(fp, "\nUsage:\n");
+  fprintf(fp, "  %s [options]\n\n", program_invocation_name);
+
   fprintf(fp, "Options:\n");
-  fprintf(fp, "  -n,--ifname=<name>          Interface name\n");
-  fprintf(fp,
-          "  -a,--ifaddress=<addr>       Interface address (only with -n)\n");
-  fprintf(fp, "\n");
-  fprintf(fp, "  -m,--tunnel-mode=%-6s     L3 payload mode%s\n", IFMODE_L3_OPT,
-          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L3_OPT) == 0 ? "  (default)" : "");
-  fprintf(fp, "  -m,--tunnel-mode=%-6s     L2 payload mode%s\n", IFMODE_L2_OPT,
-          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L2_OPT) == 0 ? " (default)" : "");
-  fprintf(fp, "\n");
-  fprintf(fp, "  -b,--bridge-name=<name>     Bridge interface (L2 payload)\n");
-  fprintf(fp, "  -i,--bridge-members=<ifname>[,<if_name>...]\n");
+  fprintf(fp, "  -n, --ifname=<name>          Interface name\n");
   fprintf(
       fp,
-      "                              Bridge members   (only with bridge)\n");
-  fprintf(fp, "  -a,--ifaddress=<addr>       Bridge interface address (only "
-              "with -b)\n");
-  fprintf(fp, "\n");
-  fprintf(fp, "  -t,--transfer-mode=%-6s   Stdio mode%s\n", TRMODE_STDIO_OPT,
+      "  -a, --ifaddress=<addr>       Interface address (only with -n)\n\n");
+
+  fprintf(fp, "  -m, --tunnel-mode=%-6s     L3 payload mode%s\n", IFMODE_L3_OPT,
+          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L3_OPT) == 0 ? "  (default)" : "");
+  fprintf(fp, "  -m, --tunnel-mode=%-6s     L2 payload mode%s\n\n",
+          IFMODE_L2_OPT,
+          strcmp(IFMODE_DEFAULT_OPT, IFMODE_L2_OPT) == 0 ? " (default)" : "");
+
+  fprintf(fp, "  -b, --bridge-name=<name>     Bridge interface (L2 payload)\n");
+  fprintf(fp, "  -i, --bridge-members=<ifname>[,<if_name>...]\n");
+  fprintf(fp,
+          "                              Bridge members (only with bridge)\n");
+  fprintf(fp, "  -a, --ifaddress=<addr>       Bridge interface address (only "
+              "with -b)\n\n");
+
+  fprintf(fp, "  -t, --transfer-mode=%-6s   Stdio mode%s\n", TRMODE_STDIO_OPT,
           strcmp(TRMODE_DEFAULT_OPT, TRMODE_STDIO_OPT) == 0 ? "       (default)"
                                                             : "");
   fprintf(
-      fp, "  -t,--transfer-mode=%-6s   TCP server mode%s\n", TRMODE_SERVER_OPT,
+      fp, "  -t, --transfer-mode=%-6s   TCP server mode%s\n", TRMODE_SERVER_OPT,
       strcmp(TRMODE_DEFAULT_OPT, TRMODE_SERVER_OPT) == 0 ? "  (default)" : "");
   fprintf(
-      fp, "  -t,--transfer-mode=%-6s   TCP client mode%s\n", TRMODE_CLIENT_OPT,
+      fp, "  -t, --transfer-mode=%-6s   TCP client mode%s\n", TRMODE_CLIENT_OPT,
       strcmp(TRMODE_DEFAULT_OPT, TRMODE_CLIENT_OPT) == 0 ? "  (default)" : "");
-  fprintf(fp, "  -l,--address=<addr>         Listen Address   (default: any) "
-              "  (TCP server)\n");
+  fprintf(fp, "  -l, --address=<addr>         Listen Address (default: any) "
+              "(TCP server)\n");
   fprintf(fp,
-          "  -p,--port=<port>            Listen port      (default: %5s) (TCP "
+          "  -p, --port=<port>            Listen port (default: %5s) (TCP "
           "server)\n",
           PORT_DEFAULT);
-  fprintf(fp, "  -l,--address=<addr>         Connect Address  (required)       "
-              "(TCP client)\n");
+  fprintf(fp, "  -l, --address=<addr>         Connect Address (required) (TCP "
+              "client)\n");
   fprintf(fp,
-          "  -p,--port=<port>            Connect Port     (default: %5s) (TCP "
+          "  -p, --port=<port>            Connect Port (default: %5s) (TCP "
           "client)\n",
           PORT_DEFAULT);
-  fprintf(fp, "  -4,--ipv4                   Force ipv4       (TCP server or "
-              "TCP client)\n");
-  fprintf(fp, "  -6,--ipv6                   Force ipv6       (TCP server or "
-              "TCP client)\n");
-  fprintf(fp, "  -M,--mptcp                  Enable MPTCP     (TCP server or "
-              "TCP client)\n");
-  fprintf(fp, "\n");
-  fprintf(fp, "  -c,--compress               Compress mode\n");
-  fprintf(fp, "\n");
-  fprintf(fp, "  -F,--max-frame-size=<size>  Max frame size (default: %zu)\n",
+  fprintf(
+      fp,
+      "  -4, --ipv4                   Force ipv4 (TCP server or TCP client)\n");
+  fprintf(
+      fp,
+      "  -6, --ipv6                   Force ipv6 (TCP server or TCP client)\n");
+  fprintf(fp, "  -M, --mptcp                  Enable MPTCP (TCP server or TCP "
+              "client)\n\n");
+
+  fprintf(fp, "  -c, --compress               Compress mode\n\n");
+
+  fprintf(fp, "  -F, --max-frame-size=<size>  Max frame size (default: %zu)\n",
           (size_t)IF_MAX_FRAME_SIZE_DEF);
-  fprintf(fp, "  -I,--ifbuffer-size=<size>   Interface buffer size\n");
-  fprintf(fp, "                   (default: <Max frame size> * 2)\n");
-  fprintf(fp, "  -T,--trbuffer-size=<size>   Transfer buffer size\n");
-  fprintf(fp, "                   (default: <Interface Buffersize>)\n");
-  fprintf(fp, "\n");
-  fprintf(fp, "  -v,--version                Print version\n");
-  fprintf(fp, "  -h,--help                   Print this usage\n");
-  fprintf(fp, "\n");
+  fprintf(fp, "  -I, --ifbuffer-size=<size>   Interface buffer size (default: "
+              "<Max frame size> * 2)\n");
+  fprintf(fp, "  -T, --trbuffer-size=<size>   Transfer buffer size (default: "
+              "<Interface Buffersize>)\n\n");
+
+  fprintf(fp, "  -v, --version                Print version\n");
+  fprintf(fp, "  -h, --help                   Print this usage\n\n");
 }
 
 int change_ifflags(int sock, const char *ifname, int flags_clear,
@@ -152,7 +162,7 @@ int change_ifflags(int sock, const char *ifname, int flags_clear,
     perror("Cannot get interface flags");
     return -1;
   }
-  short flags_new = (ifr.ifr_flags & ~flags_clear) | flags_set;
+  short flags_new = (short)((ifr.ifr_flags & ~flags_clear) | flags_set);
   if (flags_new != ifr.ifr_flags) {
     ifr.ifr_flags = flags_new;
     if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
@@ -185,9 +195,10 @@ int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
     break;
   }
 
-#ifdef IFF_NO_PI
-  ifr.ifr_flags |= IFF_NO_PI;
+#ifndef IFF_NO_PI
+#error "IFF_NO_PI is not defined (require kernel >= 2.6.27)"
 #endif
+  ifr.ifr_flags |= IFF_NO_PI;
 
   if (0 < strlen(ifname) && strlen(ifname) < IFNAMSIZ) {
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
@@ -205,7 +216,7 @@ int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
   return fd;
 }
 
-int get_ifindex(int sock, const char *ifname) {
+int get_ifindex(int sock, const char ifname[IFNAMSIZ]) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
@@ -217,7 +228,7 @@ int get_ifindex(int sock, const char *ifname) {
   return ifr.ifr_ifindex;
 }
 
-int create_bridge(int sock, char *brname) {
+int create_bridge(int sock, char brname[IFNAMSIZ]) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
@@ -332,7 +343,7 @@ int convert_bits_to_netmask(int family, int bits, void *mask) {
         mask6->s6_addr[i] = 0xff;
         bits -= 8;
       } else if (bits > 0) {
-        mask6->s6_addr[i] = 0xff << (8 - bits);
+        mask6->s6_addr[i] = (0xff << (8 - bits)) & 0xff;
         bits = 0;
       } else {
         mask6->s6_addr[i] = 0;
@@ -365,7 +376,7 @@ int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
   memset(&ifr6, 0, sizeof(ifr6));
   ifr6.ifr6_ifindex = ifindex;
   memcpy(&ifr6.ifr6_addr, &addr6, sizeof(addr6));
-  ifr6.ifr6_prefixlen = masksize;
+  ifr6.ifr6_prefixlen = masksize & 0xff;
   if (ioctl(sock6, SIOCSIFADDR, (void *)&ifr6) < 0) {
     perror("Cannot set interface address");
     return -1;
@@ -542,7 +553,7 @@ int init_if(struct tuncat_commandline_options *optsp) {
     }
 
     if (optsp->braddifname) {
-      int len = strlen(optsp->braddifname);
+      size_t len = strlen(optsp->braddifname);
       char *braddifname = alloca(len + 1);
       char *ifname, *ifn;
 
@@ -574,7 +585,7 @@ static size_t read_packet_size(const char *buf) {
 
 static void write_packet_size(char *buf, size_t size) {
   assert(size <= 65535);
-  *(uint16_t *)buf = htons(size);
+  *(uint16_t *)buf = htons(size & 65535);
 }
 
 int forward_packets(int argc, char *const argv[],
@@ -626,8 +637,8 @@ int forward_packets(int argc, char *const argv[],
   // Transfer Information
   write_packet_size(&tr_send_buf[tr_send_buf_pos], 0);
   tr_send_buf_pos += IF_FRAME_SIZE_LEN;
-  tr_send_buf[tr_send_buf_pos++] = optsp->ifmode;
-  tr_send_buf[tr_send_buf_pos++] = optsp->compflag;
+  tr_send_buf[tr_send_buf_pos++] = (char)optsp->ifmode;
+  tr_send_buf[tr_send_buf_pos++] = (char)optsp->compflag;
   write_packet_size(&tr_send_buf[tr_send_buf_pos], optsp->max_frame_size);
   tr_send_buf_pos += IF_FRAME_SIZE_LEN;
 
@@ -870,7 +881,7 @@ int forward_packets(int argc, char *const argv[],
       if (rsiz == 0) {
         return EXIT_SUCCESS;
       }
-      tr_recv_buf_pos += rsiz;
+      tr_recv_buf_pos += (size_t)rsiz;
       continue;
     }
 
@@ -890,7 +901,7 @@ int forward_packets(int argc, char *const argv[],
         perror("write");
         return EXIT_FAILURE;
       }
-      if_write_buf_pos -= IF_FRAME_SIZE_LEN + wsiz;
+      if_write_buf_pos -= IF_FRAME_SIZE_LEN + (size_t)wsiz;
       memmove(if_write_buf, &if_write_buf[IF_FRAME_SIZE_LEN + wsiz],
               if_write_buf_pos);
       continue;
@@ -913,8 +924,8 @@ int forward_packets(int argc, char *const argv[],
       if (rsiz == 0) {
         return EXIT_SUCCESS;
       }
-      write_packet_size(if_read_buf, rsiz);
-      if_read_buf_pos += IF_FRAME_SIZE_LEN + rsiz;
+      write_packet_size(if_read_buf, (size_t)rsiz);
+      if_read_buf_pos += IF_FRAME_SIZE_LEN + (size_t)rsiz;
       continue;
     }
 
@@ -933,7 +944,7 @@ int forward_packets(int argc, char *const argv[],
         perror("write");
         return EXIT_FAILURE;
       }
-      tr_send_buf_pos -= wsiz;
+      tr_send_buf_pos -= (size_t)wsiz;
       if (tr_send_buf_pos > 0) {
         memmove(tr_send_buf, tr_send_buf + wsiz, tr_send_buf_pos);
       }
@@ -977,7 +988,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.ifmode != IFMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -m\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       if (strcasecmp(optarg, IFMODE_L2_OPT) == 0) {
@@ -986,7 +997,7 @@ int main(int argc, char *const argv[]) {
         opts.ifmode = IFMODE_L3;
       } else {
         fprintf(stderr, "Invalid tunnel interface mode \"%s\"\n", optarg);
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       break;
@@ -995,7 +1006,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.ifname != NULL) {
         fprintf(stderr, "Duplicated option -n\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.ifname = optarg;
@@ -1005,7 +1016,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.addr != NULL) {
         fprintf(stderr, "Duplicated option -a\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.addr = optarg;
@@ -1015,7 +1026,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.brname != NULL) {
         fprintf(stderr, "Duplicated option -b\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.brname = optarg;
@@ -1025,7 +1036,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.braddifname != NULL) {
         fprintf(stderr, "Duplicated option -i\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.braddifname = optarg;
@@ -1035,7 +1046,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.trmode != TRMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -t\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       if (strcmp(optarg, TRMODE_STDIO_OPT) == 0) {
@@ -1046,7 +1057,7 @@ int main(int argc, char *const argv[]) {
         opts.trmode = TRMODE_CLIENT;
       } else {
         fprintf(stderr, "Invalid transfer mode \"%s\"\n", optarg);
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       break;
@@ -1055,7 +1066,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.node != NULL) {
         fprintf(stderr, "Duplicated option -l\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.node = optarg;
@@ -1065,7 +1076,7 @@ int main(int argc, char *const argv[]) {
       assert(optarg != NULL);
       if (opts.port != NULL) {
         fprintf(stderr, "Duplicated option -p\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.port = optarg;
@@ -1074,7 +1085,7 @@ int main(int argc, char *const argv[]) {
     case '4':
       if (opts.ipmode != IPMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -4 or -6\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.ipmode = IPMODE_IPV4;
@@ -1083,7 +1094,7 @@ int main(int argc, char *const argv[]) {
     case '6':
       if (opts.ipmode != IPMODE_UNSPEC) {
         fprintf(stderr, "Duplicated option -4 or -6\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.ipmode = IPMODE_IPV6;
@@ -1092,7 +1103,7 @@ int main(int argc, char *const argv[]) {
     case 'M':
       if (opts.mptcp) {
         fprintf(stderr, "Duplicated option -M\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.mptcp = 1;
@@ -1101,7 +1112,7 @@ int main(int argc, char *const argv[]) {
     case 'c':
       if (opts.compflag != COMPFLAG_UNSPEC) {
         fprintf(stderr, "Duplicated option -c\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       opts.compflag = COMPFLAG_COMPRESS;
@@ -1110,7 +1121,7 @@ int main(int argc, char *const argv[]) {
     case 'F':
       if (opts.max_frame_size != 0) {
         fprintf(stderr, "Duplicated option -F\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       {
@@ -1118,13 +1129,13 @@ int main(int argc, char *const argv[]) {
         opts.max_frame_size = strtoul(optarg, &p, 0);
         if (p == optarg || *p != '\0') {
           fprintf(stderr, "Invalid option value -F\n");
-          print_usage(stderr, argc, argv);
+          print_usage(stderr);
           return EXIT_FAILURE;
         }
         if (opts.max_frame_size < IF_MAX_FRAME_SIZE_MIN ||
             opts.max_frame_size > IF_MAX_FRAME_SIZE_MAX) {
           fprintf(stderr, "Invalid option value -F\n");
-          print_usage(stderr, argc, argv);
+          print_usage(stderr);
           return EXIT_FAILURE;
         }
       }
@@ -1132,7 +1143,7 @@ int main(int argc, char *const argv[]) {
     case 'I':
       if (opts.ifbuffer_size != 0) {
         fprintf(stderr, "Duplicated option -I\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       {
@@ -1140,13 +1151,13 @@ int main(int argc, char *const argv[]) {
         opts.ifbuffer_size = strtoul(optarg, &p, 0);
         if (p == optarg || *p != '\0') {
           fprintf(stderr, "Invalid option value -I\n");
-          print_usage(stderr, argc, argv);
+          print_usage(stderr);
           return EXIT_FAILURE;
         }
         if (opts.ifbuffer_size < IF_BUFFER_SIZE_MIN ||
             opts.ifbuffer_size > IF_BUFFER_SIZE_MAX) {
           fprintf(stderr, "Invalid option value -I\n");
-          print_usage(stderr, argc, argv);
+          print_usage(stderr);
           return EXIT_FAILURE;
         }
       }
@@ -1154,7 +1165,7 @@ int main(int argc, char *const argv[]) {
     case 'T':
       if (opts.trbuffer_size != 0) {
         fprintf(stderr, "Duplicated option -T\n");
-        print_usage(stderr, argc, argv);
+        print_usage(stderr);
         return EXIT_FAILURE;
       }
       {
@@ -1162,13 +1173,13 @@ int main(int argc, char *const argv[]) {
         opts.trbuffer_size = strtoul(optarg, &p, 0);
         if (p == optarg || *p != '\0') {
           fprintf(stderr, "Invalid option value -T\n");
-          print_usage(stderr, argc, argv);
+          print_usage(stderr);
           return EXIT_FAILURE;
         }
         if (opts.trbuffer_size < TR_BUFFER_SIZE_MIN ||
             opts.trbuffer_size > TR_BUFFER_SIZE_MAX) {
           fprintf(stderr, "Invalid option value -T\n");
-          print_usage(stderr, argc, argv);
+          print_usage(stderr);
           return EXIT_FAILURE;
         }
       }
@@ -1178,11 +1189,11 @@ int main(int argc, char *const argv[]) {
       return EXIT_SUCCESS;
     case 'h':
       fprintf(stdout, "%s : Create tunnel interface\n", PACKAGE_STRING);
-      print_usage(stdout, argc, argv);
+      print_usage(stdout);
       return EXIT_SUCCESS;
     default:
       fprintf(stderr, "Invalid option -%c\n", optopt);
-      print_usage(stderr, argc, argv);
+      print_usage(stderr);
       return EXIT_FAILURE;
     }
   }
@@ -1193,7 +1204,7 @@ int main(int argc, char *const argv[]) {
 
   if (opts.brname != NULL && opts.ifmode == IFMODE_L3) {
     fprintf(stderr, "-b is not supported for L3 mode\n");
-    print_usage(stderr, argc, argv);
+    print_usage(stderr);
     return EXIT_FAILURE;
   }
 
@@ -1206,12 +1217,12 @@ int main(int argc, char *const argv[]) {
   case TRMODE_STDIO:
     if (opts.node != NULL) {
       fprintf(stderr, "-l is not supported for stdio mode\n");
-      print_usage(stderr, argc, argv);
+      print_usage(stderr);
       return EXIT_FAILURE;
     }
     if (opts.port != NULL) {
       fprintf(stderr, "-p is not supported for stdio mode\n");
-      print_usage(stderr, argc, argv);
+      print_usage(stderr);
       return EXIT_FAILURE;
     }
     if (opts.ipmode != 0) {
@@ -1225,7 +1236,7 @@ int main(int argc, char *const argv[]) {
   case TRMODE_CLIENT:
     if (opts.node == NULL) {
       fprintf(stderr, "-l is required for client mode\n");
-      print_usage(stderr, argc, argv);
+      print_usage(stderr);
       return EXIT_FAILURE;
     }
     break;
@@ -1237,7 +1248,7 @@ int main(int argc, char *const argv[]) {
 
   if (opts.braddifname != NULL && opts.brname == NULL) {
     fprintf(stderr, "-i is not supported without -b\n");
-    print_usage(stderr, argc, argv);
+    print_usage(stderr);
     return EXIT_FAILURE;
   }
 

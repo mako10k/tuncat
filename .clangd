@@ -7,5 +7,12 @@ CompileFlags:
     - -Wall
     - -Wextra
     - -Werror
+    - -Wconversion
+    - -Wsign-conversion
+    - -Wformat=2
+    - -Wimplicit-fallthrough
     - -pedantic
     - -std=gnu11
+    - -DHAVE_CONFIG_H
+    - -I.
+    - -I..

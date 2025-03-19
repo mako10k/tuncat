@@ -1,6 +1,4 @@
-#ifndef __TUNCAT_H__
-#define __TUNCAT_H__
-
+#pragma once
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #else
@@ -78,6 +76,4 @@ struct tuncat_commandline_options {
   size_t trbuffer_size;
 };
 
-void print_usage(FILE *, int, char *const[]);
-
-#endif
+void print_usage(FILE *);
