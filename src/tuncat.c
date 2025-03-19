@@ -588,12 +588,8 @@ static void write_packet_size(char *buf, size_t size) {
   *(uint16_t *)buf = htons(size & 65535);
 }
 
-int forward_packets(int argc, char *const argv[],
-                    struct tuncat_commandline_options *optsp, int tunfd,
+int forward_packets(struct tuncat_commandline_options *optsp, int tunfd,
                     int tr_ifd, int tr_ofd) {
-  (void)argc;
-  (void)argv;
-
   enum compflag compflag = optsp->compflag;
 
   size_t max_frame_size =
@@ -1257,8 +1253,7 @@ int main(int argc, char *const argv[]) {
     if (tunfd == -1) {
       return EXIT_FAILURE;
     }
-    return forward_packets(argc, argv, &opts, tunfd, STDIN_FILENO,
-                           STDOUT_FILENO);
+    return forward_packets(&opts, tunfd, STDIN_FILENO, STDOUT_FILENO);
   }
 
   {
@@ -1360,12 +1355,12 @@ int main(int argc, char *const argv[]) {
 
       if (pid == 0) {
         close(sock);
-        return forward_packets(argc, argv, &opts, tunfd, csock, csock);
+        return forward_packets(&opts, tunfd, csock, csock);
       }
 
       close(csock);
     }
   } else {
-    return forward_packets(argc, argv, &opts, tunfd, sock, sock);
+    return forward_packets(&opts, tunfd, sock, sock);
   }
 }
