@@ -30,6 +30,16 @@ AC_FUNC_ALLOCA
 AC_FUNC_FORK
 AC_CHECK_FUNCS([atexit memmove memset select socket strcasecmp strchr strtol strtoul])
 
+DX_HTML_FEATURE(ON)
+DX_CHM_FEATURE(OFF)
+DX_CHI_FEATURE(OFF)
+DX_MAN_FEATURE(ON)
+DX_RTF_FEATURE(OFF)
+DX_XML_FEATURE(OFF)
+DX_PDF_FEATURE(OFF)
+DX_PS_FEATURE(OFF)
+
+DX_INIT_DOXYGEN([$PACKAGE_NAME], [$(top_srcdir)/Doxygen.config], [docs])
+
 AC_CONFIG_FILES([Makefile src/Makefile])
-AC_CONFIG_FILES([tuncat.spec])
 AC_OUTPUT

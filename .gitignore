@@ -1,9 +1,7 @@
 /aclocal.m4
-/autoscan.log
 /compile
 /config.h
 /config.h.in
-/config.log
 /config.status
 /configure
 /configure.scan
@@ -20,8 +18,10 @@ Makefile.in
 *~
 *.o
 *.tar.gz
+*.log
 
 .deps/
+/docs/
 
 /src/tuncat
 /tuncat.spec

@@ -7,6 +7,7 @@
 #include <linux/if_tun.h>
 #include <linux/ipv6.h>
 #include <linux/sockios.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,14 +218,22 @@ static int cmp_addr(int family, const void *addr1, const void *addr2) {
   }
 }
 
+static in_addr_t convert_mask4(int bits) {
+  return (in_addr_t)htonl((uint32_t)(~0U << (32 - bits)));
+}
+
+static in_addr_t apply_mask4(in_addr_t net, in_addr_t addr, in_addr_t mask) {
+  return (net & mask) | (addr & ~mask);
+}
+
 static int convert_nworkaddr(const void *addr, int bits, void *broadcastaddr) {
   if (bits < 0 || bits > 32) {
     return -1;
   }
   struct in_addr *addr4 = (struct in_addr *)addr;
   struct in_addr *networkaddr4 = (struct in_addr *)broadcastaddr;
-  uint32_t mask = htonl(~((1 << (32 - bits)) - 1));
-  networkaddr4->s_addr = addr4->s_addr & mask;
+  in_addr_t mask = convert_mask4(bits);
+  networkaddr4->s_addr = apply_mask4(addr4->s_addr, 0U, mask);
   return 0;
 }
 
@@ -234,8 +243,8 @@ static int convert_bcastaddr(const void *addr, int bits, void *broadcastaddr) {
   }
   struct in_addr *addr4 = (struct in_addr *)addr;
   struct in_addr *bcastaddr4 = (struct in_addr *)broadcastaddr;
-  uint32_t mask = htonl(~((1 << (32 - bits)) - 1));
-  bcastaddr4->s_addr = (addr4->s_addr & mask) | ~mask;
+  uint32_t mask = convert_mask4(bits);
+  bcastaddr4->s_addr = apply_mask4(addr4->s_addr, ~0U, mask);
   return 0;
 }
 
@@ -245,7 +254,7 @@ int convert_bits_to_netmask(int family, int bits, void *mask) {
       return -1;
     }
     struct in_addr *mask4 = mask;
-    mask4->s_addr = htonl(~((1 << (32 - bits)) - 1));
+    mask4->s_addr = convert_mask4(bits);
   } else if (family == AF_INET6) {
     if (bits < 0 || bits > 128) {
       return -1;
