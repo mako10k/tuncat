@@ -8,8 +8,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define inet_net_pton inet_net_pton_orig
-
 void print_usage(FILE *fp) {
   extern char *program_invocation_name;
   fprintf(fp, "\nUsage:\n");
@@ -88,7 +86,7 @@ int main(int argc, char *const argv[]) {
   }
 
   if (opts.trmode == TRMODE_STDIO) {
-    int tunfd = init_if(&opts);
+    int tunfd = tuncat_if_init(&opts);
     if (tunfd == -1) {
       return EXIT_FAILURE;
     }
@@ -97,7 +95,7 @@ int main(int argc, char *const argv[]) {
                : EXIT_SUCCESS;
   }
 
-  int tunfd = init_if(&opts);
+  int tunfd = tuncat_if_init(&opts);
   if (tunfd == -1) {
     return EXIT_FAILURE;
   }

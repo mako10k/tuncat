@@ -15,7 +15,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-int inet6_net_pton(int af, const char *cp, void *buf, size_t len) {
+static int tuncat_inet6_net_pton(int af, const char *cp, void *buf,
+                                 size_t len) {
   if (af != AF_INET6) {
     errno = EAFNOSUPPORT;
     return -1;
@@ -57,17 +58,17 @@ end:
   return (int)bits;
 }
 
-int inet_net_pton_orig(int af, const char *cp, void *buf, size_t len) {
+int tuncat_inet_net_pton(int af, const char *cp, void *buf, size_t len) {
   if (af == AF_INET)
     return inet_net_pton(af, cp, buf, len);
   if (af == AF_INET6)
-    return inet6_net_pton(af, cp, buf, len);
+    return tuncat_inet6_net_pton(af, cp, buf, len);
   errno = EAFNOSUPPORT;
   return -1;
 }
 
-int change_ifflags(int sock, const char *ifname, int flags_clear,
-                   int flags_set) {
+static int tuncat_if_ifflags_modify(int sock, const char *ifname,
+                                    int flags_clear, int flags_set) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
@@ -89,7 +90,7 @@ int change_ifflags(int sock, const char *ifname, int flags_clear,
   return 0;
 }
 
-int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
+static int tuncat_if_create_tun(int sock, char *ifname, enum ifmode ifmode) {
   int fd;
   struct ifreq ifr;
 
@@ -124,14 +125,15 @@ int create_tunif(int sock, char *ifname, enum ifmode ifmode) {
   }
   strncpy(ifname, ifr.ifr_name, IFNAMSIZ);
 
-  if (change_ifflags(sock, ifr.ifr_name, 0, IFF_UP | IFF_RUNNING) < 0) {
+  if (tuncat_if_ifflags_modify(sock, ifr.ifr_name, 0, IFF_UP | IFF_RUNNING) <
+      0) {
     return -1;
   }
 
   return fd;
 }
 
-int get_ifindex(int sock, const char ifname[IFNAMSIZ]) {
+static int tuncat_if_index_get(int sock, const char ifname[IFNAMSIZ]) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
@@ -143,7 +145,7 @@ int get_ifindex(int sock, const char ifname[IFNAMSIZ]) {
   return ifr.ifr_ifindex;
 }
 
-int create_bridge(int sock, char brname[IFNAMSIZ]) {
+static int tuncat_if_create_bridge(int sock, char brname[IFNAMSIZ]) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
@@ -156,7 +158,7 @@ int create_bridge(int sock, char brname[IFNAMSIZ]) {
   return 0;
 }
 
-int delete_bridge(int sock, char *brname) {
+static int tuncat_if_delete_bridge(int sock, char *brname) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
@@ -169,12 +171,13 @@ int delete_bridge(int sock, char *brname) {
   return 0;
 }
 
-int add_bridge_member(int sock, const char *brname, const char *ifname) {
+static int tuncat_if_add_bridge_member(int sock, const char *brname,
+                                       const char *ifname) {
   struct ifreq ifr;
 
   memset(&ifr, 0, sizeof(ifr));
   strncpy(ifr.ifr_name, brname, IFNAMSIZ);
-  ifr.ifr_ifindex = get_ifindex(sock, ifname);
+  ifr.ifr_ifindex = tuncat_if_index_get(sock, ifname);
   if (ifr.ifr_ifindex == 0) {
     fprintf(stderr, "Cannot get interface index\n");
     return -1;
@@ -189,7 +192,7 @@ int add_bridge_member(int sock, const char *brname, const char *ifname) {
 
 char *brname = NULL;
 
-void cleanbr(void) {
+static void tuncat_if_clean_bridge(void) {
   if (brname) {
     int sock;
 
@@ -197,18 +200,19 @@ void cleanbr(void) {
       perror("socket");
       return;
     }
-    change_ifflags(sock, brname, IFF_UP, 0);
-    delete_bridge(sock, brname);
+    tuncat_if_ifflags_modify(sock, brname, IFF_UP, 0);
+    tuncat_if_delete_bridge(sock, brname);
     close(sock);
   }
 }
 
-void cleanbr_sig(int sig) {
+static void tuncat_if_clean_bridge_by_signal(int sig) {
   (void)sig;
-  cleanbr();
+  tuncat_if_clean_bridge();
 }
 
-static int cmp_addr(int family, const void *addr1, const void *addr2) {
+static int tuncat_if_addr_cmp(int family, const void *addr1,
+                              const void *addr2) {
   if (family == AF_INET) {
     return memcmp(addr1, addr2, sizeof(struct in_addr));
   } else if (family == AF_INET6) {
@@ -218,43 +222,46 @@ static int cmp_addr(int family, const void *addr1, const void *addr2) {
   }
 }
 
-static in_addr_t convert_mask4(int bits) {
+static in_addr_t tuncat_if_masklen_to_in_addr(int bits) {
   return (in_addr_t)htonl((uint32_t)(~0U << (32 - bits)));
 }
 
-static in_addr_t apply_mask4(in_addr_t net, in_addr_t addr, in_addr_t mask) {
+static in_addr_t tuncat_if_in_addr_modify(in_addr_t net, in_addr_t addr,
+                                          in_addr_t mask) {
   return (net & mask) | (addr & ~mask);
 }
 
-static int convert_nworkaddr(const void *addr, int bits, void *broadcastaddr) {
+static int tuncat_if_addr4masklen_to_networkaddr(const void *addr, int bits,
+                                                 void *networkaddr) {
   if (bits < 0 || bits > 32) {
     return -1;
   }
   struct in_addr *addr4 = (struct in_addr *)addr;
-  struct in_addr *networkaddr4 = (struct in_addr *)broadcastaddr;
-  in_addr_t mask = convert_mask4(bits);
-  networkaddr4->s_addr = apply_mask4(addr4->s_addr, 0U, mask);
+  struct in_addr *networkaddr4 = (struct in_addr *)networkaddr;
+  in_addr_t mask = tuncat_if_masklen_to_in_addr(bits);
+  networkaddr4->s_addr = tuncat_if_in_addr_modify(addr4->s_addr, 0U, mask);
   return 0;
 }
 
-static int convert_bcastaddr(const void *addr, int bits, void *broadcastaddr) {
+static int tuncat_if_addr4masklen_to_broadcastaddr(const void *addr, int bits,
+                                                   void *broadcastaddr) {
   if (bits < 0 || bits > 32) {
     return -1;
   }
   struct in_addr *addr4 = (struct in_addr *)addr;
   struct in_addr *bcastaddr4 = (struct in_addr *)broadcastaddr;
-  uint32_t mask = convert_mask4(bits);
-  bcastaddr4->s_addr = apply_mask4(addr4->s_addr, ~0U, mask);
+  uint32_t mask = tuncat_if_masklen_to_in_addr(bits);
+  bcastaddr4->s_addr = tuncat_if_in_addr_modify(addr4->s_addr, ~0U, mask);
   return 0;
 }
 
-int convert_bits_to_netmask(int family, int bits, void *mask) {
+static int tuncat_if_masklen_to_addr(int family, int bits, void *mask) {
   if (family == AF_INET) {
     if (bits < 0 || bits > 32) {
       return -1;
     }
     struct in_addr *mask4 = mask;
-    mask4->s_addr = convert_mask4(bits);
+    mask4->s_addr = tuncat_if_masklen_to_in_addr(bits);
   } else if (family == AF_INET6) {
     if (bits < 0 || bits > 128) {
       return -1;
@@ -279,18 +286,19 @@ int convert_bits_to_netmask(int family, int bits, void *mask) {
   return 0;
 }
 
-int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
+static int tuncat_if_ifaddr6_set(int sock6, const char *ifname,
+                                 const char *addrstr) {
   struct in6_ifreq ifr6;
   struct in6_addr addr6;
 
   memset(&addr6, 0, sizeof(addr6));
-  int masksize = inet_net_pton(AF_INET6, addrstr, &addr6, sizeof(addr6));
+  int masksize = tuncat_inet_net_pton(AF_INET6, addrstr, &addr6, sizeof(addr6));
   if (masksize < 0) {
     fprintf(stderr, "Invalid address\n");
     return -1;
   }
 
-  int ifindex = get_ifindex(sock6, ifname);
+  int ifindex = tuncat_if_index_get(sock6, ifname);
   if (ifindex == 0) {
     fprintf(stderr, "Cannot get interface index\n");
     return -1;
@@ -308,7 +316,8 @@ int set_ifaddr6(int sock6, const char *ifname, const char *addrstr) {
   return 0;
 }
 
-int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
+static int tuncat_if_ifaddr_set(int sock, const char *ifname,
+                                const char *addrstr) {
   assert(sock >= 0);
   assert(ifname != NULL);
   assert(addrstr != NULL);
@@ -319,8 +328,8 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = 0;
-    int masklen =
-        inet_net_pton(AF_INET, addrstr, &addr.sin_addr, sizeof(addr.sin_addr));
+    int masklen = tuncat_inet_net_pton(AF_INET, addrstr, &addr.sin_addr,
+                                       sizeof(addr.sin_addr));
     if (masklen < 0) {
       break;
     }
@@ -328,31 +337,33 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
     memset(&mask, 0, sizeof(mask));
     mask.sin_family = AF_INET;
     mask.sin_port = 0;
-    if (convert_bits_to_netmask(AF_INET, masklen, &mask.sin_addr) < 0) {
+    if (tuncat_if_masklen_to_addr(AF_INET, masklen, &mask.sin_addr) < 0) {
       break;
     }
 
     memset(&nwork, 0, sizeof(nwork));
     nwork.sin_family = AF_INET;
     nwork.sin_port = 0;
-    if (convert_nworkaddr(&addr.sin_addr, masklen, &nwork.sin_addr) < 0) {
+    if (tuncat_if_addr4masklen_to_networkaddr(&addr.sin_addr, masklen,
+                                              &nwork.sin_addr) < 0) {
       break;
     }
 
     memset(&bcast, 0, sizeof(bcast));
     bcast.sin_family = AF_INET;
     bcast.sin_port = 0;
-    if (convert_bcastaddr(&addr.sin_addr, masklen, &bcast.sin_addr) < 0) {
+    if (tuncat_if_addr4masklen_to_broadcastaddr(&addr.sin_addr, masklen,
+                                                &bcast.sin_addr) < 0) {
       break;
     }
 
     if (masklen < 31) {
       // check except netmask is /31 or /31, see RFC 3021
-      if (cmp_addr(AF_INET, &addr.sin_addr, &nwork.sin_addr) == 0) {
+      if (tuncat_if_addr_cmp(AF_INET, &addr.sin_addr, &nwork.sin_addr) == 0) {
         fprintf(stderr, "Cannot set address as network address\n");
         break;
       }
-      if (cmp_addr(AF_INET, &addr.sin_addr, &bcast.sin_addr) == 0) {
+      if (tuncat_if_addr_cmp(AF_INET, &addr.sin_addr, &bcast.sin_addr) == 0) {
         fprintf(stderr, "Cannot set address as broadcast addr\n");
         break;
       }
@@ -384,7 +395,7 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
         perror("Cannot set interface broadcast address");
         return -1;
       }
-      if (change_ifflags(sock, ifname, 0, IFF_BROADCAST) < 0) {
+      if (tuncat_if_ifflags_modify(sock, ifname, 0, IFF_BROADCAST) < 0) {
         return -1;
       }
     } else {
@@ -397,7 +408,7 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
         perror("Cannot set interface broadcast address");
         return -1;
       }
-      if (change_ifflags(sock, ifname, IFF_BROADCAST, 0) < 0) {
+      if (tuncat_if_ifflags_modify(sock, ifname, IFF_BROADCAST, 0) < 0) {
         return -1;
       }
     }
@@ -410,7 +421,7 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
     perror("socket");
     return -1;
   }
-  if (set_ifaddr6(sock6, ifname, addrstr) < 0) {
+  if (tuncat_if_ifaddr6_set(sock6, ifname, addrstr) < 0) {
     close(sock6);
     return -1;
   }
@@ -419,7 +430,7 @@ int set_ifaddr(int sock, const char *ifname, const char *addrstr) {
   return 0;
 }
 
-int init_if(struct tuncat_commandline_options *optsp) {
+int tuncat_if_init(struct tuncat_commandline_options *optsp) {
   int sock = socket(PF_INET, SOCK_DGRAM, 0);
   if (sock == -1) {
     perror("socket");
@@ -431,14 +442,14 @@ int init_if(struct tuncat_commandline_options *optsp) {
     strncpy(tunname, optsp->ifname, IFNAMSIZ - 1);
     tunname[IFNAMSIZ - 1] = '\0';
   }
-  int tunfd = create_tunif(sock, tunname, optsp->ifmode);
+  int tunfd = tuncat_if_create_tun(sock, tunname, optsp->ifmode);
   if (tunfd == -1) {
     return EXIT_FAILURE;
   }
 
   if (optsp->brname == NULL) {
     if (optsp->addr != NULL) {
-      if (set_ifaddr(sock, optsp->ifname, optsp->addr) < 0) {
+      if (tuncat_if_ifaddr_set(sock, optsp->ifname, optsp->addr) < 0) {
         return EXIT_FAILURE;
       }
     }
@@ -446,32 +457,33 @@ int init_if(struct tuncat_commandline_options *optsp) {
   } else {
     int brindex;
 
-    brindex = get_ifindex(sock, optsp->brname);
+    brindex = tuncat_if_index_get(sock, optsp->brname);
     if (brindex == 0) {
-      brindex = create_bridge(sock, optsp->brname);
+      brindex = tuncat_if_create_bridge(sock, optsp->brname);
       if (brindex == -1) {
         return EXIT_FAILURE;
       }
       brname = optsp->brname;
-      atexit(cleanbr);
+      atexit(tuncat_if_clean_bridge);
       struct sigaction sa;
       memset(&sa, 0, sizeof(sa));
-      sa.sa_handler = cleanbr_sig;
+      sa.sa_handler = tuncat_if_clean_bridge_by_signal;
       sigaction(SIGINT, &sa, NULL);
       sigaction(SIGTERM, &sa, NULL);
     }
 
-    if (change_ifflags(sock, optsp->brname, 0, IFF_UP | IFF_RUNNING) < 0) {
+    if (tuncat_if_ifflags_modify(sock, optsp->brname, 0, IFF_UP | IFF_RUNNING) <
+        0) {
       return EXIT_FAILURE;
     }
 
     if (optsp->addr != NULL) {
-      if (set_ifaddr(sock, optsp->brname, optsp->addr) < 0) {
+      if (tuncat_if_ifaddr_set(sock, optsp->brname, optsp->addr) < 0) {
         return EXIT_FAILURE;
       }
     }
 
-    if (add_bridge_member(sock, optsp->brname, tunname) < 0) {
+    if (tuncat_if_add_bridge_member(sock, optsp->brname, tunname) < 0) {
       return EXIT_FAILURE;
     }
 
@@ -486,7 +498,7 @@ int init_if(struct tuncat_commandline_options *optsp) {
         if ((ifn = strchr(ifname, ','))) {
           *ifn = '\0';
         }
-        if (add_bridge_member(sock, brname, ifname) < 0) {
+        if (tuncat_if_add_bridge_member(sock, brname, ifname) < 0) {
           return EXIT_FAILURE;
         }
         if (!ifn) {
